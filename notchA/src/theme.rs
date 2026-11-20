@@ -118,7 +118,7 @@ pub fn tone(
     }
 }
 
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     Color::from_rgba(
         a.r + (b.r - a.r) * t,
         a.g + (b.g - a.g) * t,

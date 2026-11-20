@@ -167,10 +167,12 @@ fn beyond(s: &Screen, x: f64, y: f64) -> f64 {
 
 pub fn begin_carry(app: AppHandle) {
     if core::DRAGGING.swap(true, SeqCst) {
+        core::carry_visual(&app, true);
         return;
     }
     std::thread::spawn(move || {
         run(&app);
+        core::carry_visual(&app, false);
         core::DRAGGING.store(false, SeqCst);
         core::place_notch(&app);
     });

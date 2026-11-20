@@ -7,6 +7,7 @@ mod agy_cli;
 mod antigravity;
 mod backdrop;
 mod carry;
+mod carry_view;
 mod claude_accounts;
 mod claude_auth;
 mod codex;
@@ -18,8 +19,10 @@ mod doctor;
 mod focus;
 mod fullscreen;
 mod glyphs;
+mod goo;
 mod hooks_install;
 mod i18n;
+mod motion;
 mod notch_view;
 mod notchmenu;
 mod opencode;
@@ -62,10 +65,12 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 enum Msg {
     Ui(UiEvent),
+    Noop,
     NotchWindowOpened(window::Id),
     SettingsWindowOpened(window::Id),
     ResetWindowOpened(window::Id),
     TaskbarHoverOpened(window::Id),
+    CarryWindowOpened(window::Id),
     WindowClosed(window::Id),
     GotHwnd(String, window::Id, isize),
     Tick(Instant),
@@ -82,10 +87,18 @@ struct NotchA {
     settings_id: Option<window::Id>,
     reset_id: Option<window::Id>,
     tb_hover_id: Option<window::Id>,
+    carry_id: Option<window::Id>,
+    carry_ui: carry_view::CarryUiState,
+    last_frame: Option<Instant>,
+    last_screen_cursor: Point,
+    motion_on: bool,
+    glide: Option<WindowGlide>,
+    reset_appear: motion::Tween,
 
     notch_ui: notch_view::NotchUiState,
     cells: Vec<notch_view::NotchCell>,
     last_cursor: Point,
+    last_card_id: Option<String>,
     passthrough: bool,
     started_at: Instant,
     collapse_at: Option<Instant>,
@@ -98,7 +111,14 @@ struct NotchA {
     last_backdrop_probe: Instant,
 }
 
+struct WindowGlide {
+    from: Point,
+    to: Point,
+    start: Instant,
+}
+
 impl NotchA {
+
     fn boot() -> (Self, Task<Msg>) {
         let cfg = config::load();
         let port = cfg.port;
@@ -148,16 +168,24 @@ impl NotchA {
             let _ = id;
         }
 
-        let app_state = Self {
+        let mut app_state = Self {
             app,
             active_reset: None,
             notch_id: None,
             settings_id: None,
             reset_id: None,
             tb_hover_id: None,
+            carry_id: None,
+            carry_ui: carry_view::CarryUiState::default(),
+            last_frame: None,
+            last_screen_cursor: Point::ORIGIN,
+            motion_on: motion::motion_enabled(),
+            glide: None,
+            reset_appear: motion::Tween::default(),
             notch_ui,
             cells,
             last_cursor: Point::ORIGIN,
+            last_card_id: None,
             passthrough: true,
             started_at: Instant::now(),
             collapse_at: None,
@@ -168,6 +196,8 @@ impl NotchA {
             system_look: settings_window::get_system_look(),
             last_backdrop_probe: Instant::now(),
         };
+        app_state.notch_ui.anim.fold.jump(if cfg.notch_on_hover { 1.0 } else { 0.0 });
+        app_state.notch_ui.anim.fold_t = app_state.notch_ui.anim.fold.value(Instant::now());
         (app_state, open_task)
     }
 
@@ -194,6 +224,10 @@ impl NotchA {
                 self.tb_hover_id = Some(id);
                 fetch_hwnd_task("taskbar-hover", id)
             }
+            Msg::CarryWindowOpened(id) => {
+                self.carry_id = Some(id);
+                window::enable_mouse_passthrough(id)
+            }
             Msg::WindowClosed(id) => {
                 if self.settings_id == Some(id) {
                     self.settings_id = None;
@@ -204,6 +238,8 @@ impl NotchA {
                 } else if self.tb_hover_id == Some(id) {
                     self.tb_hover_id = None;
                     self.app.unregister_hwnd("taskbar-hover");
+                } else if self.carry_id == Some(id) {
+                    self.carry_id = None;
                 }
                 Task::none()
             }
@@ -222,19 +258,17 @@ impl NotchA {
             }
             Msg::Ui(ev) => self.handle_ui_event(ev),
             Msg::Tick(now) => {
+                let dt = self.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
+                self.last_frame = Some(now);
                 self.notch_ui.anim_secs = self.started_at.elapsed().as_secs_f32();
+                self.notch_ui.anim.tick(now, dt.min(0.05));
+                self.notch_ui.grip_out = self.notch_ui.anim.grip_out;
                 self.notch_ui.refreshing_ids.retain(|_, until| *until > now);
-                let target_grip = if self.notch_ui.orb_hovered || self.notch_ui.grip_hovered { 1.0 } else { 0.0 };
-                let diff = target_grip - self.notch_ui.grip_out;
-                if diff.abs() > 0.01 {
-                    self.notch_ui.grip_out += diff * 0.25;
-                } else {
-                    self.notch_ui.grip_out = target_grip;
-                }
                 if let Some(t) = self.collapse_at {
                     if now >= t {
                         self.collapse_at = None;
                         self.notch_ui.card_open = false;
+                        self.notch_ui.anim.set_card(false, now, self.motion_on);
                         core::EXPANDED.store(false, Ordering::Relaxed);
                     }
                 }
@@ -245,6 +279,8 @@ impl NotchA {
                         if (on_hover || self.notch_ui.full_screen) && !self.notch_ui.pointer_in && !self.notch_ui.menu_open && !DRAGGING.load(Ordering::SeqCst) {
                             self.notch_ui.folded = true;
                             self.notch_ui.card_open = false;
+                            self.notch_ui.anim.set_folded(true, now, self.motion_on);
+                            self.notch_ui.anim.set_card(false, now, self.motion_on);
                             core::EXPANDED.store(false, Ordering::Relaxed);
                         }
                     }
@@ -253,8 +289,35 @@ impl NotchA {
                     self.last_backdrop_probe = Instant::now();
                     self.update_backdrop_probe();
                 }
-                Task::none()
+                let mut tasks = Vec::new();
+                if let Some(glide) = &self.glide {
+                    let t = now.saturating_duration_since(glide.start).as_millis() as f32 / motion::GLIDE_MS as f32;
+                    if let Some(id) = self.notch_id {
+                        let k = motion::glide(t.min(1.0));
+                        tasks.push(window::move_to(id, Point::new(
+                            motion::lerp(glide.from.x, glide.to.x, k),
+                            motion::lerp(glide.from.y, glide.to.y, k),
+                        )));
+                    }
+                    if t >= 1.0 {
+                        self.glide = None;
+                        tasks.push(self.place_notch_task());
+                    }
+                }
+                let cur = self.app.cursor_position().ok().map(|p| Point::new(p.x as f32, p.y as f32));
+                let last = self.last_screen_cursor;
+                self.carry_ui.tick(now, cur, last, dt);
+                if let Some(c) = cur { self.last_screen_cursor = c; }
+                if self.carry_ui.active {
+                    if let Some(c) = cur {
+                        if let Some(id) = self.carry_id {
+                            tasks.push(window::move_to(id, Point::new(c.x - 150.0, c.y - 70.0)));
+                        }
+                    }
+                }
+                Task::batch(tasks)
             }
+            Msg::Noop => Task::none(),
             Msg::WatchdogPoll => self.poll_pointer_watchdog(),
             Msg::Notch(nmsg) => self.handle_notch_msg(nmsg),
             Msg::Settings(smsg) => {
@@ -315,10 +378,14 @@ impl NotchA {
                         if fs && !self.notch_ui.pointer_in {
                             self.notch_ui.folded = true;
                             self.notch_ui.card_open = false;
+                            let now = Instant::now();
+                            self.notch_ui.anim.set_folded(true, now, self.motion_on);
+                            self.notch_ui.anim.set_card(false, now, self.motion_on);
                         } else if !fs {
                             let on_hover = self.app.state::<AppState>().cfg.lock().unwrap().notch_on_hover;
                             if !on_hover {
                                 self.notch_ui.folded = false;
+                                self.notch_ui.anim.set_folded(false, Instant::now(), self.motion_on);
                             }
                         }
                     }
@@ -328,12 +395,14 @@ impl NotchA {
                             Some("light") => Some("light".into()),
                             _ => None,
                         };
+                         self.notch_ui.anim.set_palette(self.notch_ui.behind.is_some(), Instant::now(), self.motion_on);
                     }
                     _ => {}
                 }
                 Task::none()
             }
-            UiEvent::PlaceNotch | UiEvent::GlideNotch => self.place_notch_task(),
+            UiEvent::PlaceNotch => { self.glide = None; self.place_notch_task() }
+            UiEvent::GlideNotch => self.glide_notch_task(),
             UiEvent::ApplyTheme => {
                 self.notch_ui.dark = core::resolved_theme(&self.app) != "light";
                 if let Some(w) = self.app.get_webview_window("settings") {
@@ -349,8 +418,10 @@ impl NotchA {
                 tray::set_visible(tray_vis);
                 if !on_hover && !self.notch_ui.full_screen {
                     self.notch_ui.folded = false;
+                    self.notch_ui.anim.set_folded(false, Instant::now(), self.motion_on);
                 } else if on_hover && !self.notch_ui.pointer_in {
                     self.notch_ui.folded = true;
+                    self.notch_ui.anim.set_folded(true, Instant::now(), self.motion_on);
                 }
                 if notch_vis {
                     if self.notch_id.is_some() {
@@ -390,6 +461,8 @@ impl NotchA {
             UiEvent::ShowResetAlert => {
                 let Some(payload) = reset_alert::active_card(&self.app) else { return Task::none(); };
                 self.active_reset = Some(payload.clone());
+                let now = Instant::now();
+                self.reset_appear = motion::Tween { from: 0.0, to: 1.0, start: now, duration: Duration::from_millis(180), curve: motion::EASE_OUT };
                 let close_old = self.reset_id.take().map(|id| { self.app.unregister_hwnd("reset-alert"); window::close(id) }).unwrap_or_else(Task::none);
                 let scale = core::target_screen(&self.app).map(|s| s.scale).unwrap_or(1.0);
                 let (_id, task) = window::open(window::Settings {
@@ -451,6 +524,28 @@ impl NotchA {
                 self.app.send_ui(UiEvent::OpenSettings);
                 Task::none()
             }
+            UiEvent::CarryVisual(active) => {
+                if active {
+                    self.carry_ui.begin(&self.notch_ui.edge, self.notch_ui.dark, self.notch_ui.scale, Instant::now());
+                    let (_id, task) = window::open(window::Settings {
+                        size: Size::new(300.0, 150.0),
+                        position: window::Position::Default,
+                        decorations: false,
+                        transparent: true,
+                        resizable: false,
+                        level: window::Level::AlwaysOnTop,
+                        exit_on_close_request: false,
+                        ..Default::default()
+                    });
+                    task.map(Msg::CarryWindowOpened)
+                } else {
+                    self.carry_ui.end();
+                    if let Some(id) = self.carry_id.take() {
+                        return window::close(id);
+                    }
+                    Task::none()
+                }
+            }
             UiEvent::Quit => iced::exit(),
         }
     }
@@ -462,6 +557,7 @@ impl NotchA {
                 self.fold_at = None;
                 self.collapse_at = None;
                 self.notch_ui.folded = false;
+                self.notch_ui.anim.set_folded(false, Instant::now(), self.motion_on);
             }
             notch_view::NotchMsg::PointerExited => {
                 self.notch_ui.pointer_in = false;
@@ -469,6 +565,11 @@ impl NotchA {
                 self.notch_ui.grip_hovered = false;
                 self.collapse_at = Some(Instant::now() + Duration::from_millis(250));
                 self.fold_at = Some(Instant::now() + Duration::from_millis(450));
+                let now = Instant::now();
+                self.notch_ui.anim.set_folded(true, now, self.motion_on);
+                self.notch_ui.anim.set_card(false, now, self.motion_on);
+                self.notch_ui.anim.set_orb(false, now, self.motion_on);
+                self.notch_ui.anim.set_grip(false);
             }
             notch_view::NotchMsg::PointerMoved(pt) => {
                 self.last_cursor = pt;
@@ -480,9 +581,14 @@ impl NotchA {
                 let grip_dist = ((p.x - layout.grip_center.x).powi(2) + (p.y - layout.grip_center.y).powi(2)).sqrt();
                 self.notch_ui.orb_hovered = orb_dist <= 28.5;
                 self.notch_ui.grip_hovered = (self.notch_ui.orb_hovered || self.notch_ui.grip_hovered) && grip_dist <= 26.3 && !self.notch_ui.orb_hovered;
+                let now = Instant::now();
+                let hov = self.notch_ui.orb_hovered || self.notch_ui.grip_hovered;
+                self.notch_ui.anim.set_orb(hov, now, self.motion_on);
+                self.notch_ui.anim.set_grip(hov);
 
                 if self.notch_ui.orb_hovered || self.notch_ui.grip_hovered {
                     self.notch_ui.card_open = false;
+                    self.notch_ui.anim.set_card(false, Instant::now(), self.motion_on);
                     core::EXPANDED.store(false, Ordering::Relaxed);
                 } else if layout.pill_rect.contains(p) {
                     self.collapse_at = None;
@@ -498,6 +604,12 @@ impl NotchA {
                         self.notch_ui.hover_id = Some(cid);
                     }
                     self.notch_ui.card_open = true;
+                    let now = Instant::now();
+                    if self.notch_ui.hover_id.as_deref() != self.last_card_id.as_deref() {
+                        self.last_card_id = self.notch_ui.hover_id.clone();
+                        self.notch_ui.anim.release(now, self.motion_on);
+                    }
+                    self.notch_ui.anim.set_card(true, now, self.motion_on);
                     core::EXPANDED.store(true, Ordering::Relaxed);
                 } else if layout.card_rect.is_some_and(|r| r.contains(p)) || layout.tail_rect.is_some_and(|r| r.contains(p)) {
                     self.collapse_at = None;
@@ -522,9 +634,17 @@ impl NotchA {
                     carry::begin_carry(self.app.clone());
                 } else if let Some(cid) = self.cell_at(p, &layout) {
                     self.notch_ui.pressing = Some((p, cid));
+                    let now = Instant::now();
+                    self.notch_ui.anim.set_press(true);
+                    self.notch_ui.anim.turn(0.25, now, self.motion_on);
                 }
             }
             notch_view::NotchMsg::LeftRelease => {
+                let now = Instant::now();
+                self.notch_ui.anim.set_press(false);
+                self.notch_ui.anim.set_grip(false);
+                self.notch_ui.anim.turn(0.0, now, self.motion_on);
+                self.notch_ui.anim.release(now, self.motion_on);
                 if let Some((_start, cid)) = self.notch_ui.pressing.take() {
                     let base = self
                         .cells
@@ -623,6 +743,35 @@ impl NotchA {
         }
     }
 
+    fn glide_notch_task(&mut self) -> Task<Msg> {
+        let Some(id) = self.notch_id else { return self.place_notch_task(); };
+        let Some(mon) = core::target_screen(&self.app) else { return self.place_notch_task(); };
+        let Some(from) = self.app.get_webview_window("notch").and_then(|w| w.outer_position().ok()) else {
+            return self.place_notch_task();
+        };
+        let (edge, ratio, scale) = {
+            let c = self.app.state::<AppState>().cfg.lock().unwrap();
+            let edge = config::edge_or_right(&c.notch_edge);
+            (edge.clone(), c.along(&edge), config::snap_scale(c.scale) as f32)
+        };
+        let (lw, lh) = core::notch_window_size(&edge);
+        let ww = ((lw * mon.scale * scale as f64).round() as i32).min(mon.w.max(1));
+        let wh = ((lh * mon.scale * scale as f64).round() as i32).min(mon.h.max(1));
+        let (px, py) = core::edge_origin(&mon, &edge, ww, wh, ratio);
+        let from = Point::new(from.x as f32 / mon.scale as f32, from.y as f32 / mon.scale as f32);
+        let to = Point::new(px as f32 / mon.scale as f32, py as f32 / mon.scale as f32);
+        if (from.x - to.x).abs() < 0.5 && (from.y - to.y).abs() < 0.5 {
+            self.glide = None;
+            return self.place_notch_task();
+        }
+        if !self.motion_on {
+            self.glide = None;
+            return self.place_notch_task();
+        }
+        self.glide = Some(WindowGlide { from, to, start: Instant::now() });
+        let _ = id;
+        Task::none()
+    }
     fn place_notch_task(&mut self) -> Task<Msg> {
         let (edge, ratio, scale) = {
             let c = self.app.state::<AppState>().cfg.lock().unwrap();
@@ -648,6 +797,9 @@ impl NotchA {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Msg> {
+        if Some(id) == self.carry_id {
+            return carry_view::view(&self.carry_ui).map(|_| Msg::Noop);
+        }
         if Some(id) == self.notch_id {
             return notch_view::view(&self.app, &self.notch_ui, &self.cells).map(Msg::Notch);
         }
@@ -663,7 +815,7 @@ impl NotchA {
             .map(Msg::Settings);
         }
         if Some(id) == self.reset_id {
-            if let Some(payload) = &self.active_reset { return reset_view::view(payload, self.notch_ui.dark).map(Msg::Reset); }
+            if let Some(payload) = &self.active_reset { return reset_view::view(payload, self.notch_ui.dark, self.reset_appear.value(Instant::now())).map(Msg::Reset); }
         }
         if Some(id) == self.tb_hover_id {
             if let Some((item_id, _, _, _)) = taskbar::current_hover_info() {
@@ -726,14 +878,16 @@ impl NotchA {
         let acts = self.app.state::<AppState>().activity.lock().unwrap().clone();
         let any_active = !self.notch_ui.folded
             && self.cells.iter().any(|c| notch_view::work_state_of(&c.base, &store_snap, &acts) != "idle");
-        let animating = any_active
-            || !self.notch_ui.refreshing_ids.is_empty()
+        let transient = !self.notch_ui.refreshing_ids.is_empty()
             || self.collapse_at.is_some()
             || self.fold_at.is_some()
-            || (self.notch_ui.grip_out > 0.01 && self.notch_ui.grip_out < 0.99);
-
-        if animating {
-            subs.push(iced::time::every(Duration::from_millis(33)).map(Msg::Tick));
+            || self.notch_ui.anim.busy(Instant::now())
+            || self.glide.is_some()
+            || self.carry_ui.busy()
+            || !self.reset_appear.done(Instant::now());
+        if transient || any_active {
+            let period = if transient { 16 } else { 33 };
+            subs.push(iced::time::every(Duration::from_millis(period)).map(Msg::Tick));
         }
 
         Subscription::batch(subs)

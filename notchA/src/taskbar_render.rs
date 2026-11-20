@@ -164,7 +164,7 @@ impl Renderer {
     }
 
     /// `pressed` holds the cells being refreshed or clicked, drawn at the notch's pressed size.
-    pub fn draw(&mut self, frame: &Frame, scale: f32, pressed: &[usize], seconds: f32) -> Result<()> {
+    pub fn draw(&mut self, frame: &Frame, scale: f32, pressed: &[(usize, f32)], seconds: f32) -> Result<()> {
         let seconds = if seconds.is_finite() { seconds } else { 0.0 };
         let slots = taskbar_model::layout(frame, self.width as f32, self.height as f32, scale);
         // Every cell shares one unit and one font size, so the formats are fetched once a frame.
@@ -199,7 +199,7 @@ impl Renderer {
                     for slot in &slots {
                         let Some(item) = frame.items.get(slot.index) else { continue };
                         let letter_format = if letter(&item.provider).chars().count() > 1 { small } else { big };
-                        self.draw_cell(item, slot, frame, &colours, pressed.contains(&slot.index), seconds, origin, pct, letter_format)?;
+                        self.draw_cell(item, slot, frame, &colours, pressed.iter().find(|(i, _)| *i == slot.index).map(|(_, p)| *p).unwrap_or(0.0), seconds, origin, pct, letter_format)?;
                     }
                 }
                 self.context.PopAxisAlignedClip();
@@ -223,13 +223,13 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_cell(&self, item: &Indicator, slot: &Slot, frame: &Frame, colours: &Palette, pressed: bool,
+    unsafe fn draw_cell(&self, item: &Indicator, slot: &Slot, frame: &Frame, colours: &Palette, press: f32,
         seconds: f32, origin: (f32, f32), pct: &IDWriteTextFormat, letter_format: &IDWriteTextFormat) -> Result<()> {
         self.context.PushAxisAlignedClip(&D2D_RECT_F { left:slot.x, top:0.0,
             right:slot.x + slot.width, bottom:self.height as f32 }, D2D1_ANTIALIAS_MODE_ALIASED);
         let (cx, cy, u) = (slot.center_x, slot.center_y, slot.unit);
         // `.ringwrap.pressed`: the ring, its reading, the activity and the glyph shrink together.
-        let s = if pressed { PRESSED } else { 1.0 };
+        let s = 1.0 - (1.0 - PRESSED) * press.clamp(0.0, 1.0);
         self.context.SetTransform(&matrix(s, origin.0 + cx * (1.0 - s), origin.1 + cy * (1.0 - s)));
         let center = D2D_POINT_2F { x:cx, y:cy };
         let remaining = frame.appearance.shows_remaining;
@@ -537,7 +537,7 @@ mod tests {
                 indicator("codex", None, Some(0.09), "waiting", true, false),
                 indicator("glm", Some(1.0), None, "idle", true, true),
             ], dark:true, watch:0.5, critical:0.7, appearance:Appearance::from_config(&crate::config::Config::default()) };
-            renderer.draw(&frame, 1.0, &[0], 0.75).unwrap();
+            renderer.draw(&frame, 1.0, &[(0, 0.0)], 0.75).unwrap();
             frame.dark = false;
             renderer.draw(&frame, 1.0, &[], 1.5).unwrap();
             for size in [0.8,1.0,1.25] {
@@ -546,7 +546,7 @@ mod tests {
                     frame.appearance.weekly_ring = placement.into();
                     for dashed in [false,true] {
                         frame.appearance.weekly_dashed = dashed;
-                        renderer.draw(&frame,1.0,&[1],1.6).unwrap();
+                        renderer.draw(&frame,1.0,&[(1, 0.0)],1.6).unwrap();
                     }
                 }
             }
@@ -555,7 +555,7 @@ mod tests {
             frame.items = crate::glyphs::BUILTIN.iter().enumerate().map(|(index, (provider, _))|
                 indicator(provider, Some(index as f32 / 9.0), None, "idle", index % 2 != 0, index % 3 == 0)).collect();
             renderer.resize(1120, 84).unwrap();
-            renderer.draw(&frame, 2.0, &[4, 5], 2.0).unwrap();
+            renderer.draw(&frame, 2.0, &[(4, 0.0), (5, 0.0)], 2.0).unwrap();
             frame.dark = true;
             renderer.draw(&frame, 2.0, &[], 2.5).unwrap();
             // Rejecting an invalid resize must leave the previous surface usable.

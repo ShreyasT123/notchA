@@ -44,16 +44,17 @@ impl canvas::Program<ResetMsg> for TailCanvas {
     }
 }
 
-pub fn view(payload: &CardPayload, dark: bool) -> Element<'_, ResetMsg> {
+pub fn view(payload: &CardPayload, dark: bool, appear: f32) -> Element<'_, ResetMsg> {
     let pal = theme::palette(dark);
+    let slide = (1.0 - appear.clamp(0.0, 1.0)) * 10.0;
     let (card_x, card_y) = if !payload.attached {
-        (17.0, 11.0)
+(17.0 + slide, 11.0 + slide)
     } else {
         match payload.edge.as_str() {
-            "left" => (34.0, 11.0),
-            "top" => (17.0, 22.0),
-            "bottom" => (17.0, 0.0),
-            _ => (0.0, 11.0),
+            "left" => (34.0 + slide, 11.0 + slide),
+            "top" => (17.0 + slide, 22.0 + slide),
+            "bottom" => (17.0 + slide, 0.0 + slide),
+            _ => (0.0 + slide, 11.0 + slide),
         }
     };
 

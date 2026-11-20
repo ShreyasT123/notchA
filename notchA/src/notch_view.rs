@@ -1,11 +1,12 @@
 use crate::core::{self, AppHandle, AppState, Manager, NOTCH_LONG, NOTCH_W};
-use crate::{activity, claude_auth, config, glyphs, state, theme, traymenu, usage};
+use crate::{activity, claude_auth, config, glyphs, goo, motion, state, theme, traymenu, usage};
 use iced::alignment::Vertical;
 use iced::mouse;
 use iced::widget::canvas::{self, path, Frame, Geometry, LineCap, LineJoin, Path, Stroke};
 use iced::widget::{button, column, container, image, mouse_area, row, space, stack, svg, text, Column};
 use iced::{Border, Color, Element, Font, Length, Padding, Point, Radians, Rectangle, Renderer, Size, Theme};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum NotchMsg {
@@ -47,6 +48,7 @@ pub struct NotchUiState {
     pub refreshing_ids: std::collections::HashMap<String, std::time::Instant>,
     pub insets: [f32; 4],
     pub anim_secs: f32,
+    pub anim: motion::Anim,
 }
 
 impl NotchUiState {
@@ -331,7 +333,7 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
     let mut card_rect = None;
     let mut tail_rect = None;
 
-    if ui.card_open && !ui.folded && !cells.is_empty() {
+    if ui.anim.card_t > 0.001 && !ui.folded && !cells.is_empty() {
         let idx = ui
             .hover_id
             .as_deref()
@@ -369,6 +371,17 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
         }
     }
 
+    if let (Some(cr), Some(tr)) = (card_rect, tail_rect) {
+        let t = ui.anim.card_t.clamp(0.0, 1.0);
+        let (dx, dy) = match ui.edge.as_str() {
+            "left" => (-26.0, 0.0), "right" => (26.0, 0.0),
+            "top" => (0.0, -26.0), _ => (0.0, 26.0),
+        };
+        let from_card = Rectangle::new(Point::new(cr.x + dx, cr.y + dy), Size::new(cr.width * 0.94, cr.height * 0.94));
+        let from_tail = Rectangle::new(tr.position(), Size::new(tr.width * 0.6, tr.height * 0.6));
+        card_rect = Some(lerp_rect(from_card, cr, t));
+        tail_rect = Some(lerp_rect(from_tail, tr, t));
+    }
     NotchLayout {
         pill_rect,
         rest_rect,
@@ -381,6 +394,13 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
         card_rect,
         tail_rect,
     }
+}
+
+fn lerp_rect(a: Rectangle, b: Rectangle, t: f32) -> Rectangle {
+    Rectangle::new(
+        Point::new(motion::lerp(a.x, b.x, t), motion::lerp(a.y, b.y, t)),
+        Size::new(motion::lerp(a.width, b.width, t), motion::lerp(a.height, b.height, t)),
+    )
 }
 
 pub fn hot_rects_physical(ui: &NotchUiState, cells: &[NotchCell], monitor_scale: f64) -> Vec<[f64; 4]> {
@@ -446,14 +466,19 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
         let s = self.ui.scale;
         frame.scale(s);
 
-        let pal = theme::palette(self.ui.dark);
+        let base = *theme::palette(self.ui.dark);
+        let mut pal = base;
+        if self.ui.behind.is_some() {
+            let other = *theme::palette(!self.ui.dark);
+            let t = self.ui.anim.palette_t.clamp(0.0, 1.0);
+            pal.pill = theme::lerp_color(base.pill, other.pill, t);
+            pal.edge = theme::lerp_color(base.edge, other.edge, t);
+            pal.rest_edge = theme::lerp_color(base.rest_edge, other.rest_edge, t);
+        }
 
-        if self.ui.folded {
-            let (pill_col, edge_col) = match self.ui.behind.as_deref() {
-                Some("dark") => (theme::LIGHT.pill, theme::LIGHT.rest_edge),
-                Some("light") => (theme::DARK.pill, theme::DARK.rest_edge),
-                _ => (pal.pill, pal.rest_edge),
-            };
+        let fold = self.ui.anim.fold_t.clamp(0.0, 1.0);
+
+        if fold >= 0.999 {
             let r = self.layout.rest_rect;
             let rad = match self.ui.edge.as_str() {
                 "left" => iced::border::Radius { top_left: 0.0, top_right: 6.0, bottom_right: 6.0, bottom_left: 0.0 },
@@ -464,135 +489,149 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
             let mut b = path::Builder::new();
             b.rounded_rectangle(r.position(), r.size(), rad);
             let p = b.build();
-            frame.fill(&p, pill_col);
-            frame.stroke(&p, Stroke::default().with_color(edge_col).with_width(1.0));
+            frame.fill(&p, pal.pill);
+            frame.stroke(&p, Stroke::default().with_color(pal.rest_edge).with_width(1.0));
             return vec![frame.into_geometry()];
         }
 
-        // 1. Pill silhouette with inverse fillets
-        let pill_path = build_pill_contour(&self.ui.edge, self.layout.pill_rect, 20.0, 38.7);
+        // One opaque silhouette only. Overlapping translucent paths produced a
+        // tessellation seam that looked like a diagonally split pill.
+        let morph_rect = lerp_rect(self.layout.pill_rect, self.layout.rest_rect, fold);
+        let pill_path = build_pill_contour(
+            &self.ui.edge,
+            morph_rect,
+            motion::lerp(20.0, 6.0, fold),
+            motion::lerp(38.7, 6.0, fold),
+        );
         frame.fill(&pill_path, pal.pill);
         frame.stroke(&pill_path, Stroke::default().with_color(pal.edge).with_width(1.0));
 
-        // 2. Cell rings & percentage text
-        let k = 44.0 / 56.0;
-        let ramp = self.cfg.color_transition == "ramp";
-        for (i, cell) in self.cells.iter().enumerate() {
-            let rc = self.layout.ring_centers[i];
-            let pressed = self.ui.refreshing_ids.contains_key(&cell.id);
-            let ring_scale = if pressed { 0.93 } else { 1.0 } * k;
-            let stale = stale_of(&cell.snap, self.now);
-            let fade = if stale { 0.55 } else { 1.0 };
+        let reveal = 1.0 - fold;
+        {
 
-            let head = core::ring_window(
-                &cell.base,
-                &cell.snap.windows,
-                &self.cfg.antigravity_limit,
-                &self.cfg.antigravity_model,
-            )
-            .filter(|w| cell.base != "claude" || claude_quota_current(&cell.snap, w, self.now));
-
-            let ws = work_state_of(&cell.base, &self.store_snap, &self.acts);
-
-            // Hole + Track
-            let hole_col = Color { a: pal.hole.a * fade, ..pal.hole };
-            let track_col = Color { a: pal.track.a * fade, ..pal.track };
-            frame.fill(&Path::circle(rc, 22.0 * ring_scale), hole_col);
-            frame.stroke(
-                &Path::circle(rc, 25.0 * ring_scale),
-                Stroke::default().with_color(track_col).with_width(5.0 * ring_scale),
+            let k = 44.0 / 56.0;
+            let ramp = self.cfg.color_transition == "ramp";
+            let rest_center = Point::new(
+                self.layout.rest_rect.x + self.layout.rest_rect.width * 0.5,
+                self.layout.rest_rect.y + self.layout.rest_rect.height * 0.5,
             );
+            for (i, cell) in self.cells.iter().enumerate() {
+                let stagger = (fold * 1.6 - i as f32 * 0.12).clamp(0.0, 1.0);
+                let cell_reveal = (reveal - stagger * reveal).max(0.0);
+                if cell_reveal <= 0.001 { continue; }
+                let target = self.layout.ring_centers[i];
+                let rc = Point::new(
+                    motion::lerp(target.x, rest_center.x, fold),
+                    motion::lerp(target.y, rest_center.y, fold),
+                );
+                let press = self.ui.refreshing_ids.get(&cell.id)
+                    .map(|started| motion::cell_press(*started, Instant::now(), true))
+                    .unwrap_or(0.0)
+                    .max(self.ui.anim.press_t * 0.35);
+                let ring_scale = (1.0 - 0.07 * press) * k;
+                let stale = stale_of(&cell.snap, self.now);
+                let fade = (if stale { 0.55 } else { 1.0 }) * cell_reveal;
 
-            // Weekly ring
-            if self.cfg.weekly_ring != "off" {
-                let taken = self.cfg.weekly_ring == "inside" && ws != "idle";
-                let wk = weekly_window(&cell.base, &cell.snap.windows, &self.cfg.antigravity_model)
-                    .filter(|w| cell.base != "claude" || claude_quota_current(&cell.snap, w, self.now));
-                if let Some(wk) = wk {
-                    if head.is_none_or(|h| h.id != wk.id) && !taken && wk.metered() {
-                        let r = (if self.cfg.weekly_ring == "inside" { 16.0 } else { 31.0 }) * ring_scale;
-                        let frac = if self.cfg.notch_shows_remaining {
-                            (1.0f64 - wk.used).clamp(0.0, 1.0)
-                        } else {
-                            wk.used.clamp(0.0, 1.0)
-                        } as f32;
-                        let wk_col = theme::tone(wk.used, self.cfg.watch_limit, self.cfg.critical_limit, ramp, pal);
-                        let wk_col = Color { a: 0.85 * fade, ..wk_col };
-                        let tr_col = Color { a: pal.track.a * 0.7 * fade, ..pal.track };
-                        if self.cfg.weekly_ring_dashed {
-                            draw_dashed_arc(&mut frame, rc, r, 1.0, 2.4 * ring_scale, ring_scale, tr_col);
-                            draw_dashed_arc(&mut frame, rc, r, frac, 2.4 * ring_scale, ring_scale, wk_col);
-                        } else {
-                            frame.stroke(
-                                &Path::circle(rc, r),
-                                Stroke::default().with_color(tr_col).with_width(2.4 * ring_scale),
-                            );
-                            draw_arc(&mut frame, rc, r, 0.0, frac, 2.4 * ring_scale, wk_col, LineCap::Round);
+                let head = core::ring_window(
+                    &cell.base,
+                    &cell.snap.windows,
+                    &self.cfg.antigravity_limit,
+                    &self.cfg.antigravity_model,
+                )
+                .filter(|w| cell.base != "claude" || claude_quota_current(&cell.snap, w, self.now));
+
+                let ws = work_state_of(&cell.base, &self.store_snap, &self.acts);
+
+                let hole_col = Color { a: pal.hole.a * fade, ..pal.hole };
+                let track_col = Color { a: pal.track.a * fade, ..pal.track };
+                frame.fill(&Path::circle(rc, 22.0 * ring_scale), hole_col);
+                frame.stroke(
+                    &Path::circle(rc, 25.0 * ring_scale),
+                    Stroke::default().with_color(track_col).with_width(5.0 * ring_scale),
+                );
+
+                if self.cfg.weekly_ring != "off" {
+                    let taken = self.cfg.weekly_ring == "inside" && ws != "idle";
+                    let wk = weekly_window(&cell.base, &cell.snap.windows, &self.cfg.antigravity_model)
+                        .filter(|w| cell.base != "claude" || claude_quota_current(&cell.snap, w, self.now));
+                    if let Some(wk) = wk {
+                        if head.is_none_or(|h| h.id != wk.id) && !taken && wk.metered() {
+                            let r = (if self.cfg.weekly_ring == "inside" { 16.0 } else { 31.0 }) * ring_scale;
+                            let frac = if self.cfg.notch_shows_remaining {
+                                (1.0f64 - wk.used).clamp(0.0, 1.0)
+                            } else { wk.used.clamp(0.0, 1.0) } as f32;
+                            let wk_col = theme::tone(wk.used, self.cfg.watch_limit, self.cfg.critical_limit, ramp, &pal);
+                            let wk_col = Color { a: 0.85 * fade, ..wk_col };
+                            let tr_col = Color { a: pal.track.a * 0.7 * fade, ..pal.track };
+                            if self.cfg.weekly_ring_dashed {
+                                draw_dashed_arc(&mut frame, rc, r, 1.0, 2.4 * ring_scale, ring_scale, tr_col);
+                                draw_dashed_arc(&mut frame, rc, r, frac, 2.4 * ring_scale, ring_scale, wk_col);
+                            } else {
+                                frame.stroke(&Path::circle(rc, r), Stroke::default().with_color(tr_col).with_width(2.4 * ring_scale));
+                                draw_arc(&mut frame, rc, r, 0.0, frac, 2.4 * ring_scale, wk_col, LineCap::Round);
+                            }
                         }
                     }
                 }
+
+                if let Some(h) = head {
+                    if h.metered() && h.used.is_finite() {
+                        let frac = if self.cfg.notch_shows_remaining {
+                            (1.0f64 - h.used).clamp(0.0, 1.0)
+                        } else { h.used.clamp(0.0, 1.0) } as f32;
+                        let col = theme::tone(h.used, self.cfg.watch_limit, self.cfg.critical_limit, ramp, &pal);
+                        let col = Color { a: fade, ..col };
+                        draw_arc(
+                            &mut frame,
+                            rc,
+                            25.0 * ring_scale,
+                            self.ui.anim.turn_t,
+                            frac,
+                            5.0 * ring_scale,
+                            col,
+                            LineCap::Round,
+                        );
+                    }
+                }
+
+                match ws {
+                    "running" => {
+                        let step = ((self.ui.anim_secs / 1.2).rem_euclid(1.0) * 12.0).floor() / 12.0;
+                        draw_arc(&mut frame, rc, 19.0 * ring_scale, step, 0.28, 2.5 * ring_scale,
+                            Color { a: fade, ..pal.ink }, LineCap::Round);
+                    }
+                    "attention" => {
+                        let phase = (self.ui.anim_secs / 1.1).rem_euclid(1.0);
+                        let half = (phase * 2.0).fract();
+                        let st = (half * 6.0).floor() / 6.0;
+                        let alpha = if phase < 0.5 { 1.0 - 0.75 * st } else { 0.25 + 0.75 * st };
+                        let col = Color { a: alpha * fade, ..pal.watch };
+                        frame.stroke(&Path::circle(rc, 19.0 * ring_scale),
+                            Stroke::default().with_color(col).with_width(2.5 * ring_scale));
+                    }
+                    _ => {}
+                }
+
+                let pct_str = pct_figure(&cell.snap, head, self.cfg.notch_shows_remaining);
+                frame.fill_text(canvas::Text {
+                    content: pct_str,
+                    position: Point::new(rc.x, rc.y + 34.0),
+                    color: Color { a: cell_reveal, ..pal.ink },
+                    size: iced::Pixels(13.5),
+                    font: Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT },
+                    align_x: iced::alignment::Horizontal::Center.into(),
+                    align_y: iced::alignment::Vertical::Center.into(),
+                    ..canvas::Text::default()
+                });
             }
 
-            // Headline arc
-            if let Some(h) = head {
-                if h.metered() && h.used.is_finite() {
-                    let frac = if self.cfg.notch_shows_remaining {
-                        (1.0f64 - h.used).clamp(0.0, 1.0)
-                    } else {
-                        h.used.clamp(0.0, 1.0)
-                    } as f32;
-                    let col = theme::tone(h.used, self.cfg.watch_limit, self.cfg.critical_limit, ramp, pal);
-                    let col = Color { a: fade, ..col };
-                    draw_arc(&mut frame, rc, 25.0 * ring_scale, 0.0, frac, 5.0 * ring_scale, col, LineCap::Round);
-                }
-            }
+            draw_orb_and_grip(&mut frame, &self.ui, &self.layout, &pal, reveal);
 
-            // Activity arcs
-            match ws {
-                "running" => {
-                    let step = ((self.ui.anim_secs / 1.2).rem_euclid(1.0) * 12.0).floor() / 12.0;
-                    draw_arc(&mut frame, rc, 19.0 * ring_scale, step, 0.28, 2.5 * ring_scale, pal.ink, LineCap::Round);
-                }
-                "attention" => {
-                    let phase = (self.ui.anim_secs / 1.1).rem_euclid(1.0);
-                    let half = (phase * 2.0).fract();
-                    let st = (half * 6.0).floor() / 6.0;
-                    let alpha = if phase < 0.5 { 1.0 - 0.75 * st } else { 0.25 + 0.75 * st };
-                    let col = Color { a: alpha, ..pal.watch };
-                    frame.stroke(
-                        &Path::circle(rc, 19.0 * ring_scale),
-                        Stroke::default().with_color(col).with_width(2.5 * ring_scale),
-                    );
-                }
-                _ => {}
+            if let Some(tr) = self.layout.tail_rect {
+                let tail_path = build_tail_path(&self.ui.edge, tr);
+                frame.fill(&tail_path, Color { a: self.ui.anim.card_t, ..pal.card });
             }
-
-            // Percentage text drawn cleanly below the ring inside the pill
-            let pct_str = pct_figure(&cell.snap, head, self.cfg.notch_shows_remaining);
-            frame.fill_text(canvas::Text {
-                content: pct_str,
-                position: Point::new(rc.x, rc.y + 34.0),
-                color: pal.ink,
-                size: iced::Pixels(13.5),
-                font: Font {
-                    weight: iced::font::Weight::Semibold,
-                    ..Font::DEFAULT
-                },
-align_x: iced::alignment::Horizontal::Center.into(),
-align_y: iced::alignment::Vertical::Center.into(),
-                ..canvas::Text::default()
-            });
         }
-
-        // 3. Settings orb (tucked quarter-arc at rest, filled disc on hover)
-        draw_orb_and_grip(&mut frame, &self.ui, &self.layout, pal);
-
-        // 4. Curved wedge tail when hover card is open
-        if let Some(tr) = self.layout.tail_rect {
-            let tail_path = build_tail_path(&self.ui.edge, tr);
-            frame.fill(&tail_path, pal.card);
-        }
-
         vec![frame.into_geometry()]
     }
 }
@@ -742,36 +781,48 @@ fn draw_orb_and_grip(
     ui: &NotchUiState,
     layout: &NotchLayout,
     pal: &theme::Palette,
+    reveal: f32,
 ) {
     let c = layout.orb_center;
-    if ui.orb_hovered || ui.grip_hovered {
-        let disc = Path::circle(c, 23.3);
-        frame.fill(&disc, pal.pill);
-        frame.stroke(&disc, Stroke::default().with_color(pal.edge).with_width(1.0));
+    let hover = ui.anim.orb_t.clamp(0.0, 1.0);
+    let out = ui.anim.grip_out.clamp(0.0, 1.0);
+    let a = reveal;
 
-        if ui.grip_out > 0.01 {
+    if hover > 0.001 {
+        let r = 23.3 * hover;
+        let disc = goo::disc(c, r);
+        frame.fill(&disc, Color { a: hover * a, ..pal.pill });
+        frame.stroke(&disc, Stroke::default().with_color(Color { a: hover * a, ..pal.edge }).with_width(1.0));
+
+        if out > 0.01 {
             let vert = ui.is_vertical();
-            let dot_r = 3.05 * if ui.grip_hovered { 1.3 } else { 1.0 };
-            let pitch = 9.9 * ui.grip_out;
-            let gc = layout.grip_center;
-            for line in [-0.5f32, 0.5] {
-                for row in [-1.0f32, 0.0, 1.0] {
-                    let (ox, oy) = if vert { (row * pitch, line * pitch) } else { (line * pitch, row * pitch) };
-                    let d = Path::circle(Point::new(gc.x + ox, gc.y + oy), dot_r);
-                    frame.fill(&d, pal.pill);
-                    frame.stroke(&d, Stroke::default().with_color(pal.edge).with_width(1.0));
-                }
+            let reach = 9.9 * out;
+            let dots = goo::grip_dots(layout.grip_center, reach, vert);
+            let dot_r = 3.05 * (1.0 + 0.3 * ui.anim.orb_t);
+            let neck = goo::strand(c, layout.grip_center, r * 0.9, 8.5 * out, out);
+            frame.fill(&neck, Color { a: out * a, ..pal.pill });
+            for p in goo::disc_merge(layout.grip_center, &dots, 8.5 * out, dot_r, out) {
+                frame.fill(&p, Color { a: out * a, ..pal.pill });
+                frame.stroke(&p, Stroke::default().with_color(Color { a: out * a, ..pal.edge }).with_width(0.9));
             }
         }
-    } else {
-        // At rest: subtle quarter-arc line tucked into the fillet
+
+        if ui.anim.release_t > 0.01 && out < 0.6 {
+            let arc = goo::release_arc(c, 28.5, ui.anim.release_t);
+            frame.stroke(&arc, Stroke::default().with_color(Color { a: (1.0 - out) * a, ..pal.edge }).with_width(2.2).with_line_cap(LineCap::Round));
+        }
+    }
+
+    if hover < 0.999 {
         let start_turns = match ui.edge.as_str() {
             "left" | "top" => 0.5,
             "bottom" => 0.25,
             _ => 0.75,
         };
-        draw_arc(frame, c, 28.5, start_turns, 0.25, 8.8, pal.edge, LineCap::Round);
-        draw_arc(frame, c, 28.5, start_turns, 0.25, 6.8, pal.pill, LineCap::Round);
+        let rest_a = (1.0 - hover) * a;
+        let q = goo::quarter(c, 28.5, start_turns, 0.25);
+        frame.stroke(&q, Stroke::default().with_color(Color { a: rest_a, ..pal.edge }).with_width(8.8).with_line_cap(LineCap::Round));
+        frame.stroke(&q, Stroke::default().with_color(Color { a: rest_a, ..pal.pill }).with_width(6.8).with_line_cap(LineCap::Round));
     }
 }
 
@@ -807,10 +858,21 @@ pub fn view<'a>(
 
     let mut layers: Vec<Element<'a, NotchMsg>> = vec![bg_canvas.into()];
 
-    if !ui.folded {
+    if ui.anim.fold_t < 0.98 {
         // Center SVG icons inside the 44px ring centers
         for (i, cell) in cells.iter().enumerate() {
-            let rc = layout.ring_centers[i];
+            let target = layout.ring_centers[i];
+            let rest_center = Point::new(
+                layout.rest_rect.x + layout.rest_rect.width * 0.5,
+                layout.rest_rect.y + layout.rest_rect.height * 0.5,
+            );
+            let fold = ui.anim.fold_t.clamp(0.0, 1.0);
+            let rc = Point::new(
+                motion::lerp(target.x, rest_center.x, fold),
+                motion::lerp(target.y, rest_center.y, fold),
+            );
+            let cell_reveal = ((1.0 - fold) * (1.0 - (fold * 1.6 - i as f32 * 0.12).clamp(0.0, 1.0))).max(0.0);
+            if cell_reveal < 0.02 { continue; }
             let stale = stale_of(&cell.snap, now);
             let head = core::ring_window(
                 &cell.base,
@@ -827,7 +889,7 @@ pub fn view<'a>(
                 glyphs_map.get(&cell.base),
                 &cell.glyph_fallback,
                 icon_size,
-                pal.ink_2,
+                Color { a: cell_reveal, ..pal.ink_2 },
                 dim,
             );
 
@@ -846,12 +908,13 @@ pub fn view<'a>(
         }
 
         // Gear icon when hovered
-        if ui.orb_hovered || ui.grip_hovered {
+        if ui.anim.orb_t > 0.45 {
             let gear_svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M10.03 4.66L10.14 1.97 A10.20 10.20 0 0 1 13.86 1.97 L13.97 4.66A7.60 7.60 0 0 1 15.80 5.42L17.78 3.59 A10.20 10.20 0 0 1 20.41 6.22 L18.58 8.20A7.60 7.60 0 0 1 19.34 10.03L22.03 10.14 A10.20 10.20 0 0 1 22.03 13.86 L19.34 13.97A7.60 7.60 0 0 1 18.58 15.80L20.41 17.78 A10.20 10.20 0 0 1 17.78 20.41 L15.80 18.58A7.60 7.60 0 0 1 13.97 19.34L13.86 22.03 A10.20 10.20 0 0 1 10.14 22.03 L10.03 19.34A7.60 7.60 0 0 1 8.20 18.58L6.22 20.41 A10.20 10.20 0 0 1 3.59 17.78 L5.42 15.80A7.60 7.60 0 0 1 4.66 13.97L1.97 13.86 A10.20 10.20 0 0 1 1.97 10.14 L4.66 10.03A7.60 7.60 0 0 1 5.42 8.20L3.59 6.22 A10.20 10.20 0 0 1 6.22 3.59 L8.20 5.42A7.60 7.60 0 0 1 10.03 4.66 ZM7.90 12a4.10 4.10 0 1 0 8.20 0a4.10 4.10 0 1 0 -8.20 0Z"/></svg>"#;
+            let gear_alpha = ((ui.anim.orb_t - 0.45) / 0.55).clamp(0.0, 1.0);
             let gear = svg(svg::Handle::from_memory(gear_svg.as_slice()))
                 .width(Length::Fixed(21.0 * s))
                 .height(Length::Fixed(21.0 * s))
-                .style(move |_, _| svg::Style { color: Some(pal.ink_2) });
+                .style(move |_, _| svg::Style { color: Some(Color { a: gear_alpha, ..pal.ink_2 }) });
             layers.push(
                 container(gear)
                     .width(Length::Fixed(win_w))

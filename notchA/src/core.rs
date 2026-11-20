@@ -46,6 +46,7 @@ pub enum UiEvent {
     MainThread(Box<dyn FnOnce() + Send>),
     PlaceNotch,
     GlideNotch,
+    CarryVisual(bool),
     ApplyVisibility,
     ApplyTheme,
     OpenSettings,
@@ -71,6 +72,7 @@ impl std::fmt::Debug for UiEvent {
             }
             Self::PlaceNotch => write!(f, "PlaceNotch"),
             Self::GlideNotch => write!(f, "GlideNotch"),
+            Self::CarryVisual(active) => write!(f, "CarryVisual({active})"),
             Self::ApplyVisibility => write!(f, "ApplyVisibility"),
             Self::ApplyTheme => write!(f, "ApplyTheme"),
             Self::OpenSettings => write!(f, "OpenSettings"),
@@ -578,6 +580,10 @@ pub fn place_notch(app: &AppHandle) {
 
 pub fn glide_notch(app: &AppHandle) {
     app.send_ui(UiEvent::GlideNotch);
+}
+
+pub fn carry_visual(app: &AppHandle, active: bool) {
+    app.send_ui(UiEvent::CarryVisual(active));
 }
 
 pub fn reset_bar(app: &AppHandle) {

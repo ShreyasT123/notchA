@@ -293,9 +293,14 @@ fn draw(state: &Rc<NativeState>, recreate: bool) -> windows::core::Result<()> {
         data.refreshing.retain(|_, until| *until > now);
         // A click refreshes as the notch's does: the ring presses in while the reading is fetched.
         let held = data.input.pressed.as_deref().or(data.input.right_pressed.as_deref());
-        let pressed: Vec<usize> = data.frame.items.iter().enumerate()
+        let pressed: Vec<(usize, f32)> = data.frame.items.iter().enumerate()
             .filter(|(_, item)| data.refreshing.contains_key(&item.id) || held == Some(item.id.as_str()))
-            .map(|(index, _)| index).collect();
+            .map(|(index, item)| {
+                let p = data.refreshing.get(&item.id)
+                    .map(|started| crate::motion::cell_press(*started, now, true))
+                    .unwrap_or(1.0);
+                (index, p)
+            }).collect();
         (data.renderer.take(), data.renderer_size, data.frame.clone(), data.scale, data.width, data.height, pressed)
     };
     let Some(mut renderer) = renderer else {
