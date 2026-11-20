@@ -1,0 +1,8 @@
+[package]
+name = "notchA-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "notchA hook launcher: report Claude Code hook events, auto-start main app"
+
+[dependencies]

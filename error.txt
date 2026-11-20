@@ -1,0 +1,19 @@
+    Checking notchA v0.1.0 (C:\Users\sstha\Desktop\ai_\projects\natchos\notchA\notchA)
+error[E0560]: struct `iced::widget::canvas::Text` has no field named `horizontal_alignment`
+   --> notchA\src\notch_view.rs:581:17
+    |
+581 |                 horizontal_alignment: iced::alignment::Horizontal::Center,
+    |                 ^^^^^^^^^^^^^^^^^^^^ `iced::widget::canvas::Text` does not have this field
+    |
+    = note: available fields are: `max_width`, `line_height`, `align_x`, `align_y`, `shaping`
+
+error[E0560]: struct `iced::widget::canvas::Text` has no field named `vertical_alignment`
+   --> notchA\src\notch_view.rs:582:17
+    |
+582 |                 vertical_alignment: iced::alignment::Vertical::Center,
+    |                 ^^^^^^^^^^^^^^^^^^ `iced::widget::canvas::Text` does not have this field
+    |
+    = note: available fields are: `max_width`, `line_height`, `align_x`, `align_y`, `shaping`
+
+For more information about this error, try `rustc --explain E0560`.
+error: could not compile `notchA` (bin "notchA") due to 2 previous errors
