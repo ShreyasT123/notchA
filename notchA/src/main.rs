@@ -23,6 +23,10 @@ mod goo;
 mod hooks_install;
 mod i18n;
 mod motion;
+#[cfg(windows)]
+pub mod notch_render;
+#[cfg(windows)]
+pub mod notch_native;
 mod notch_view;
 mod notchmenu;
 mod opencode;
