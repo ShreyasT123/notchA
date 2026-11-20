@@ -375,7 +375,6 @@ fn render_frame(state: &NotchState) {
 
     let frame_data = NotchFrameData {
         edge,
-        dark: state.dark.get(),
         scale,
         fold_t: anim.fold_t,
         pill_rect,
@@ -393,6 +392,7 @@ fn render_frame(state: &NotchState) {
         card_headline: String::new(),
         card_subtitle: String::new(),
         card_body: Vec::new(),
+        card_used: None,
         seconds: now_sec,
         watch_limit: cfg.watch_limit,
         critical_limit: cfg.critical_limit,

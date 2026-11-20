@@ -1,9 +1,10 @@
 //! Native Direct2D + DirectComposition renderer for the Codenotch desktop overlay.
 //! Provides hardware-accelerated rendering, 100% fluid frame pacing via DWM,
 //! and organic liquid gooey geometry for the orb and moving dots without overlapping seams.
+//! Enforces SLEEK DARK MODE ONLY with seamless concave fillets (no diagonal partitions).
 #![cfg(windows)]
 
-use std::{collections::HashMap, marker::PhantomData, rc::Rc};
+use std::{collections::HashMap, f32::consts::PI, marker::PhantomData, rc::Rc};
 use windows::{
     core::{w, Error, Interface, Result},
     Foundation::Numerics::Matrix3x2,
@@ -42,7 +43,6 @@ use windows::{
                 DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                 DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_RANGE,
-                DWRITE_WORD_WRAPPING_WRAP,
             },
             Dxgi::{
                 Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM},
@@ -54,10 +54,10 @@ use windows::{
 };
 
 const TAU: f32 = std::f32::consts::TAU;
-const PI: f32 = std::f32::consts::PI;
-const FRAC_PI_2: f32 = std::f32::consts::FRAC_PI_2;
 const FADED: f32 = 0.55;
 const PRESSED: f32 = 0.93;
+/// Circle approximation constant kappa = 4/3 * (sqrt(2) - 1)
+const KAPPA: f32 = 0.55228475;
 
 #[derive(Clone, Copy, Debug)]
 pub struct D2dPalette {
@@ -77,41 +77,23 @@ pub struct D2dPalette {
     pub ink_dim: D2D1_COLOR_F,
 }
 
-pub fn get_palette(dark: bool) -> D2dPalette {
-    if dark {
-        D2dPalette {
-            pill: rgb(0x000000),
-            edge: rgb(0x2e2e2e),
-            rest_edge: rgb(0x5c5c5c),
-            card: rgb(0x0a0a0a),
-            card_line: rgb(0x242424),
-            card_rule: rgb(0x1e1e1e),
-            hole: rgba(1.0, 1.0, 1.0, 42.0 / 255.0),
-            track: rgba(1.0, 1.0, 1.0, 48.0 / 255.0),
-            ample: rgb(0x00ff88),
-            watch: rgb(0xf2ff00),
-            crit: rgb(0xff3f00),
-            ink: rgb(0xffffff),
-            ink_2: rgb(0xe8e8ea),
-            ink_dim: rgb(0x808080),
-        }
-    } else {
-        D2dPalette {
-            pill: rgb(0xf5f5f7),
-            edge: rgb(0xd2d2d7),
-            rest_edge: rgb(0x86868b),
-            card: rgb(0xffffff),
-            card_line: rgb(0xe4e4e8),
-            card_rule: rgb(0xe8e8ec),
-            hole: rgb(0xffffff),
-            track: rgba(0.0, 0.0, 0.0, 0.16),
-            ample: rgb(0x00a356),
-            watch: rgb(0xb08800),
-            crit: rgb(0xff3f00),
-            ink: rgb(0x1d1d1f),
-            ink_2: rgb(0x1d1d1f),
-            ink_dim: rgb(0x6b6b6b),
-        }
+/// Enforce Sleek Dark Mode Only forever.
+pub fn get_palette(_dark: bool) -> D2dPalette {
+    D2dPalette {
+        pill: rgb(0x000000),
+        edge: rgb(0x2e2e2e),
+        rest_edge: rgb(0x5c5c5c),
+        card: rgb(0x0a0a0a),
+        card_line: rgb(0x242424),
+        card_rule: rgb(0x1e1e1e),
+        hole: rgba(1.0, 1.0, 1.0, 42.0 / 255.0),
+        track: rgba(1.0, 1.0, 1.0, 48.0 / 255.0),
+        ample: rgb(0x00ff88),
+        watch: rgb(0xf2ff00),
+        crit: rgb(0xff3f00),
+        ink: rgb(0xffffff),
+        ink_2: rgb(0xe8e8ea),
+        ink_dim: rgb(0x808080),
     }
 }
 
@@ -125,14 +107,13 @@ pub struct CellRenderData {
     pub text: String,
     pub stale: bool,
     pub spent: bool,
-    pub work_state: String, // "idle", "busy", "waiting"
+    pub work_state: String,
     pub press: f32,
     pub turn_t: f32,
 }
 
 pub struct NotchFrameData {
     pub edge: String,
-    pub dark: bool,
     pub scale: f32,
     pub fold_t: f32,
     pub pill_rect: D2D_RECT_F,
@@ -150,6 +131,7 @@ pub struct NotchFrameData {
     pub card_headline: String,
     pub card_subtitle: String,
     pub card_body: Vec<String>,
+    pub card_used: Option<f32>,
     pub seconds: f32,
     pub watch_limit: f64,
     pub critical_limit: f64,
@@ -312,7 +294,7 @@ impl NotchRenderer {
     }
 
     pub fn draw(&mut self, data: &NotchFrameData) -> Result<()> {
-        let pal = get_palette(data.dark);
+        let pal = get_palette(true); // Always Dark Mode
         let fold = data.fold_t.clamp(0.0, 1.0);
         let reveal = 1.0 - fold;
 
@@ -325,7 +307,6 @@ impl NotchRenderer {
                 self.context.BeginDraw();
                 self.context.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
 
-                // Scale transform
                 let s = data.scale;
                 self.context.SetTransform(&Matrix3x2 {
                     M11: s,
@@ -337,17 +318,19 @@ impl NotchRenderer {
                 });
 
                 if fold >= 0.999 {
-                    // Fully folded resting pill outline
                     self.draw_folded_rest(data.rest_rect, &data.edge, &pal)?;
                 } else {
-                    // Morphing pill contour + fillets
                     let morph_rect = lerp_rect(data.pill_rect, data.rest_rect, fold);
-                    let pill_path = self.build_pill_path(&data.edge, morph_rect, fold)?;
+                    let (fill_path, stroke_path) = self.build_pill_paths(&data.edge, morph_rect, fold)?;
+
+                    // Fill pill with pitch black
                     self.brush.SetColor(&pal.pill);
                     self.brush.SetOpacity(1.0);
-                    self.context.FillGeometry(&pill_path, &self.brush, None);
+                    self.context.FillGeometry(&fill_path, &self.brush, None);
+
+                    // Stroke outer boundary (omitting screen edge to prevent bezel seam)
                     self.brush.SetColor(&pal.edge);
-                    self.context.DrawGeometry(&pill_path, &self.brush, 1.0, &self.flat);
+                    self.context.DrawGeometry(&stroke_path, &self.brush, 1.0, &self.flat);
 
                     // Draw rings / cells
                     if reveal > 0.001 {
@@ -357,7 +340,7 @@ impl NotchRenderer {
                     // Settings Orb & Fluid MoveGrip
                     self.draw_orb_and_grip(data, &pal, reveal)?;
 
-                    // Hover Card & Tail
+                    // Gooey Toast Card & Tail Glue
                     if data.card_t > 0.001 {
                         self.draw_card_and_tail(data, &pal)?;
                     }
@@ -393,139 +376,153 @@ impl NotchRenderer {
         Ok(())
     }
 
-    unsafe fn build_pill_path(&self, edge: &str, r: D2D_RECT_F, fold: f32) -> Result<ID2D1PathGeometry> {
+    /// Builds mathematically exact cubic Bézier concave fillets without diagonal artifacts.
+    /// Returns (fill_path, open_stroke_path).
+    unsafe fn build_pill_paths(
+        &self,
+        edge: &str,
+        r: D2D_RECT_F,
+        fold: f32,
+    ) -> Result<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         let f = lerp(38.7, 6.0, fold);
         let rad = lerp(20.0, 6.0, fold);
-        let path = self.factory.CreatePathGeometry()?;
-        let sink = path.Open()?;
+
+        let fill_path = self.factory.CreatePathGeometry()?;
+        let stroke_path = self.factory.CreatePathGeometry()?;
+
+        let fill_sink = fill_path.Open()?;
+        let stroke_sink = stroke_path.Open()?;
 
         let (x0, x1, y0, y1) = (r.left, r.right, r.top, r.bottom);
+
         match edge {
             "left" => {
-                sink.BeginFigure(D2D_POINT_2F { x: x0 - 2.0, y: y0 - f }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddLine(D2D_POINT_2F { x: x0, y: y0 - f });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x0 + f, y: y0 },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 - rad, y: y0 });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x1, y: y0 },
-                    point2: D2D_POINT_2F { x: x1, y: y0 + rad },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1, y: y1 - rad });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x1, y: y1 },
-                    point2: D2D_POINT_2F { x: x1 - rad, y: y1 },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0 + f, y: y1 });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x0, y: y1 + f },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0 - 2.0, y: y1 + f });
-            }
-            "top" => {
-                sink.BeginFigure(D2D_POINT_2F { x: x0 - f, y: y0 - 2.0 }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddLine(D2D_POINT_2F { x: x0 - f, y: y0 });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x0, y: y0 + f },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0, y: y1 - rad });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0, y: y1 },
-                    point2: D2D_POINT_2F { x: x0 + rad, y: y1 },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 - rad, y: y1 });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x1, y: y1 },
-                    point2: D2D_POINT_2F { x: x1, y: y1 - rad },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1, y: y0 + f });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x1 + f, y: y0 },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 + f, y: y0 - 2.0 });
-            }
-            "bottom" => {
-                sink.BeginFigure(D2D_POINT_2F { x: x0 - f, y: y1 + 2.0 }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddLine(D2D_POINT_2F { x: x0 - f, y: y1 });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x0, y: y1 - f },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0, y: y0 + rad });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0, y: y0 },
-                    point2: D2D_POINT_2F { x: x0 + rad, y: y0 },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 - rad, y: y0 });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x1, y: y0 },
-                    point2: D2D_POINT_2F { x: x1, y: y0 + rad },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1, y: y1 - f });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x1 + f, y: y1 },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 + f, y: y1 + 2.0 });
+                let start_pt = D2D_POINT_2F { x: x0, y: y0 - f };
+                fill_sink.BeginFigure(start_pt, D2D1_FIGURE_BEGIN_FILLED);
+                stroke_sink.BeginFigure(start_pt, D2D1_FIGURE_BEGIN_HOLLOW);
+
+                // Top fillet concave
+                let seg1 = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x0, y: y0 - f + f * KAPPA },
+                    point2: D2D_POINT_2F { x: x0 + f - f * KAPPA, y: y0 },
+                    point3: D2D_POINT_2F { x: x0 + f, y: y0 },
+                };
+                fill_sink.AddBezier(&seg1);
+                stroke_sink.AddBezier(&seg1);
+
+                // Top edge & right corners
+                let line_top = D2D_POINT_2F { x: x1 - rad, y: y0 };
+                fill_sink.AddLine(line_top);
+                stroke_sink.AddLine(line_top);
+
+                let cr1 = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x1 - rad + rad * KAPPA, y: y0 },
+                    point2: D2D_POINT_2F { x: x1, y: y0 + rad - rad * KAPPA },
+                    point3: D2D_POINT_2F { x: x1, y: y0 + rad },
+                };
+                fill_sink.AddBezier(&cr1);
+                stroke_sink.AddBezier(&cr1);
+
+                let line_right = D2D_POINT_2F { x: x1, y: y1 - rad };
+                fill_sink.AddLine(line_right);
+                stroke_sink.AddLine(line_right);
+
+                let cr2 = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x1, y: y1 - rad + rad * KAPPA },
+                    point2: D2D_POINT_2F { x: x1 - rad + rad * KAPPA, y: y1 },
+                    point3: D2D_POINT_2F { x: x1 - rad, y: y1 },
+                };
+                fill_sink.AddBezier(&cr2);
+                stroke_sink.AddBezier(&cr2);
+
+                let line_bottom = D2D_POINT_2F { x: x0 + f, y: y1 };
+                fill_sink.AddLine(line_bottom);
+                stroke_sink.AddLine(line_bottom);
+
+                // Bottom fillet concave
+                let seg2 = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x0 + f - f * KAPPA, y: y1 },
+                    point2: D2D_POINT_2F { x: x0, y: y1 + f - f * KAPPA },
+                    point3: D2D_POINT_2F { x: x0, y: y1 + f },
+                };
+                fill_sink.AddBezier(&seg2);
+                stroke_sink.AddBezier(&seg2);
+
+                stroke_sink.EndFigure(D2D1_FIGURE_END_OPEN);
+
+                fill_sink.AddLine(start_pt);
+                fill_sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             }
             _ => {
                 // "right"
-                sink.BeginFigure(D2D_POINT_2F { x: x1 + 2.0, y: y0 - f }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddLine(D2D_POINT_2F { x: x1, y: y0 - f });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x1 - f, y: y0 },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0 + rad, y: y0 });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0, y: y0 },
-                    point2: D2D_POINT_2F { x: x0, y: y0 + rad },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x0, y: y1 - rad });
-                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0, y: y1 },
-                    point2: D2D_POINT_2F { x: x0 + rad, y: y1 },
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 - f, y: y1 });
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F { x: x1, y: y1 + f },
-                    size: D2D_SIZE_F { width: f, height: f },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
-                sink.AddLine(D2D_POINT_2F { x: x1 + 2.0, y: y1 + f });
+                let start_pt = D2D_POINT_2F { x: x1, y: y0 - f };
+                fill_sink.BeginFigure(start_pt, D2D1_FIGURE_BEGIN_FILLED);
+                stroke_sink.BeginFigure(start_pt, D2D1_FIGURE_BEGIN_HOLLOW);
+
+                // Top fillet: smooth concave curve into the pill
+                let top_fillet = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x1, y: y0 - f + f * KAPPA },
+                    point2: D2D_POINT_2F { x: x1 - f + f * KAPPA, y: y0 },
+                    point3: D2D_POINT_2F { x: x1 - f, y: y0 },
+                };
+                fill_sink.AddBezier(&top_fillet);
+                stroke_sink.AddBezier(&top_fillet);
+
+                // Top pill edge
+                let line_top = D2D_POINT_2F { x: x0 + rad, y: y0 };
+                fill_sink.AddLine(line_top);
+                stroke_sink.AddLine(line_top);
+
+                // Top-left corner
+                let tl_corner = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x0 + rad - rad * KAPPA, y: y0 },
+                    point2: D2D_POINT_2F { x: x0, y: y0 + rad - rad * KAPPA },
+                    point3: D2D_POINT_2F { x: x0, y: y0 + rad },
+                };
+                fill_sink.AddBezier(&tl_corner);
+                stroke_sink.AddBezier(&tl_corner);
+
+                // Left outer pill vertical edge
+                let line_left = D2D_POINT_2F { x: x0, y: y1 - rad };
+                fill_sink.AddLine(line_left);
+                stroke_sink.AddLine(line_left);
+
+                // Bottom-left corner
+                let bl_corner = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x0, y: y1 - rad + rad * KAPPA },
+                    point2: D2D_POINT_2F { x: x0 + rad - rad * KAPPA, y: y1 },
+                    point3: D2D_POINT_2F { x: x0 + rad, y: y1 },
+                };
+                fill_sink.AddBezier(&bl_corner);
+                stroke_sink.AddBezier(&bl_corner);
+
+                // Bottom pill edge
+                let line_bottom = D2D_POINT_2F { x: x1 - f, y: y1 };
+                fill_sink.AddLine(line_bottom);
+                stroke_sink.AddLine(line_bottom);
+
+                // Bottom fillet: smooth concave curve to the screen edge
+                let bottom_fillet = D2D1_BEZIER_SEGMENT {
+                    point1: D2D_POINT_2F { x: x1 - f + f * KAPPA, y: y1 },
+                    point2: D2D_POINT_2F { x: x1, y: y1 + f - f * KAPPA },
+                    point3: D2D_POINT_2F { x: x1, y: y1 + f },
+                };
+                fill_sink.AddBezier(&bottom_fillet);
+                stroke_sink.AddBezier(&bottom_fillet);
+
+                // Stroke ends without drawing on the screen edge bezel
+                stroke_sink.EndFigure(D2D1_FIGURE_END_OPEN);
+
+                // Fill closes along the screen edge
+                fill_sink.AddLine(start_pt);
+                fill_sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             }
         }
-        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink.Close()?;
-        Ok(path)
+
+        fill_sink.Close()?;
+        stroke_sink.Close()?;
+
+        Ok((fill_path, stroke_path))
     }
 
     unsafe fn draw_cells(
@@ -613,7 +610,7 @@ impl NotchRenderer {
                     M32: prev.M32 + center.y - s * size / 2.0,
                 };
                 self.context.SetTransform(&glyph_matrix);
-                self.svg_context.DrawSvgDocument(&documents[usize::from(!data.dark)]);
+                self.svg_context.DrawSvgDocument(&documents[0]); // Dark mode SVG
                 self.context.SetTransform(&prev);
             } else {
                 self.brush.SetColor(&pal.ink_2);
@@ -668,7 +665,7 @@ impl NotchRenderer {
         Ok(())
     }
 
-    /// Draws the settings orb and the fluid MoveGrip liquid droplet with continuous outer contour
+    /// Draws the settings orb and the fluid MoveGrip liquid droplet with fluid pop-up
     unsafe fn draw_orb_and_grip(
         &self,
         data: &NotchFrameData,
@@ -682,6 +679,7 @@ impl NotchRenderer {
         // 1. Resting quarter arc when orb is not hovered
         if hover < 0.999 {
             let rest_a = (1.0 - hover) * reveal;
+            let scale_rest = 1.0 - 0.14 * hover; // smooth shrink
             let start_turns = match data.edge.as_str() {
                 "left" | "top" => 0.5,
                 "bottom" => 0.25,
@@ -689,27 +687,36 @@ impl NotchRenderer {
             };
             self.brush.SetColor(&pal.edge);
             self.brush.SetOpacity(rest_a);
-            self.arc(c, 28.5, start_turns, 0.25, 8.8, &self.round)?;
+            self.arc(c, 28.5 * scale_rest, start_turns, 0.25, 8.8, &self.round)?;
             self.brush.SetColor(&pal.pill);
-            self.arc(c, 28.5, start_turns, 0.25, 6.8, &self.round)?;
+            self.arc(c, 28.5 * scale_rest, start_turns, 0.25, 6.8, &self.round)?;
         }
 
-        // 2. Hovered orb disc + fluid neck + grip dots
+        // 2. Popping orb disc + fluid neck + grip dots
         if hover > 0.001 {
-            let r = 23.3 * hover;
-            let disc_geom = self.circle_geometry(c, r)?;
+            let bounce_r = 23.3 * hover;
+            let disc_geom = self.circle_geometry(c, bounce_r)?;
+
+            // Fill & stroke the popping disc
+            self.brush.SetColor(&pal.pill);
+            self.brush.SetOpacity(hover * reveal);
+            self.context.FillGeometry(&disc_geom, &self.brush, None);
+            self.brush.SetColor(&pal.edge);
+            self.context.DrawGeometry(&disc_geom, &self.brush, 1.0, &self.flat);
+
+            // Draw spinning gear icon with fluid bounce
+            self.draw_gear_icon(c, hover, data.seconds)?;
 
             if out > 0.01 {
-                // FLUID GOO: build fused liquid geometry
+                // FLUID GOO: build fused liquid neck geometry
                 let gc = data.grip_center;
-                let neck_geom = self.build_neck_geometry(c, gc, r * 0.9, 8.5 * out, out)?;
+                let neck_geom = self.build_neck_geometry(c, gc, bounce_r * 0.9, 8.5 * out, out)?;
                 let dots = self.get_grip_dots(gc, 9.9 * out, matches!(data.edge.as_str(), "left" | "right"));
                 let dot_r = 3.05 * (1.0 + 0.3 * hover);
 
                 // Fill all liquid components with pill color
                 self.brush.SetColor(&pal.pill);
                 self.brush.SetOpacity(hover * reveal);
-                self.context.FillGeometry(&disc_geom, &self.brush, None);
                 self.context.FillGeometry(&neck_geom, &self.brush, None);
                 for dot in &dots {
                     self.context.FillEllipse(&circle(*dot, dot_r), &self.brush);
@@ -718,20 +725,48 @@ impl NotchRenderer {
                 // Stroke unified outer contours
                 self.brush.SetColor(&pal.edge);
                 self.brush.SetOpacity(hover * reveal);
-                self.context.DrawGeometry(&disc_geom, &self.brush, 1.0, &self.flat);
                 self.context.DrawGeometry(&neck_geom, &self.brush, 0.9, &self.flat);
                 for dot in &dots {
                     self.context.DrawEllipse(&circle(*dot, dot_r), &self.brush, 0.9, &self.flat);
                 }
-            } else {
-                // Just the orb disc
-                self.brush.SetColor(&pal.pill);
-                self.brush.SetOpacity(hover * reveal);
-                self.context.FillGeometry(&disc_geom, &self.brush, None);
-                self.brush.SetColor(&pal.edge);
-                self.context.DrawGeometry(&disc_geom, &self.brush, 1.0, &self.flat);
             }
         }
+        Ok(())
+    }
+
+    /// Draws the settings gear icon rotating and scaling with fluid bounce
+    unsafe fn draw_gear_icon(&self, center: D2D_POINT_2F, hover: f32, seconds: f32) -> Result<()> {
+        let mut prev = Matrix3x2::default();
+        self.context.GetTransform(&mut prev);
+        let scale = 0.5 + 0.5 * hover;
+        let angle = (hover * 360.0 - 60.0) * (PI / 180.0);
+
+        let transform = Matrix3x2 {
+            M11: scale * angle.cos(),
+            M12: scale * angle.sin(),
+            M21: -scale * angle.sin(),
+            M22: scale * angle.cos(),
+            M31: prev.M31 + center.x,
+            M32: prev.M32 + center.y,
+        };
+        self.context.SetTransform(&transform);
+
+        // Gear icon (21px box centered)
+        self.brush.SetColor(&rgb(0xe8e8ea));
+        self.brush.SetOpacity(hover);
+
+        // Core hub circle
+        self.context.DrawEllipse(&circle(D2D_POINT_2F { x: 0.0, y: 0.0 }, 4.1), &self.brush, 1.6, &self.round);
+
+        // 8 cogs
+        for i in 0..8 {
+            let cog_angle = i as f32 * (TAU / 8.0);
+            let p1 = D2D_POINT_2F { x: cog_angle.cos() * 6.5, y: cog_angle.sin() * 6.5 };
+            let p2 = D2D_POINT_2F { x: cog_angle.cos() * 9.5, y: cog_angle.sin() * 9.5 };
+            self.context.DrawLine(p1, p2, &self.brush, 2.4, &self.round);
+        }
+
+        self.context.SetTransform(&prev);
         Ok(())
     }
 
@@ -811,15 +846,18 @@ impl NotchRenderer {
         Ok(path)
     }
 
+    /// Draws the toast/status card and its trumpet tail "glue" bridge connecting to the notch
     unsafe fn draw_card_and_tail(&mut self, data: &NotchFrameData, pal: &D2dPalette) -> Result<()> {
         let alpha = data.card_t.clamp(0.0, 1.0);
 
-        // Tail wedge
+        // Trumpet Tail Wedge (The Gooey Glue Bridge)
         if let Some(tr) = data.tail_rect {
             let tail_path = self.build_tail_path(&data.edge, tr)?;
             self.brush.SetColor(&pal.card);
             self.brush.SetOpacity(alpha);
             self.context.FillGeometry(&tail_path, &self.brush, None);
+            self.brush.SetColor(&pal.card_line);
+            self.context.DrawGeometry(&tail_path, &self.brush, 1.0, &self.flat);
         }
 
         // Card body
@@ -831,16 +869,18 @@ impl NotchRenderer {
             self.brush.SetColor(&pal.card_line);
             self.context.DrawRoundedRectangle(&rounded, &self.brush, 1.0, &self.flat);
 
-            // Text
-            let title_fmt = self.format(DWRITE_FONT_WEIGHT_BOLD, 13.0)?;
-            let body_fmt = self.format(DWRITE_FONT_WEIGHT_REGULAR, 11.5)?;
+            // Card Text formatting
+            let title_fmt = self.format(DWRITE_FONT_WEIGHT_BOLD, 13.5)?;
+            let sub_fmt = self.format(DWRITE_FONT_WEIGHT_REGULAR, 11.0)?;
+            let body_fmt = self.format(DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.5)?;
 
+            // Header Title
             let wide_title: Vec<u16> = data.card_headline.encode_utf16().collect();
             let text_rect = D2D_RECT_F {
                 left: cr.left + 14.0,
                 top: cr.top + 14.0,
                 right: cr.right - 14.0,
-                bottom: cr.top + 34.0,
+                bottom: cr.top + 32.0,
             };
             self.brush.SetColor(&pal.ink);
             self.context.DrawText(
@@ -852,7 +892,61 @@ impl NotchRenderer {
                 DWRITE_MEASURING_MODE_NATURAL,
             );
 
-            let mut y = cr.top + 36.0;
+            // Subtitle
+            if !data.card_subtitle.is_empty() {
+                let wide_sub: Vec<u16> = data.card_subtitle.encode_utf16().collect();
+                let sub_rect = D2D_RECT_F {
+                    left: cr.left + 14.0,
+                    top: cr.top + 32.0,
+                    right: cr.right - 14.0,
+                    bottom: cr.top + 48.0,
+                };
+                self.brush.SetColor(&pal.ink_dim);
+                self.context.DrawText(
+                    &wide_sub,
+                    &sub_fmt,
+                    &sub_rect,
+                    &self.brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            // Quota Progress Bar (Gooey Glue Status)
+            if let Some(used) = data.card_used {
+                let bar_top = cr.top + 54.0;
+                let bar_width = (cr.right - cr.left) - 28.0;
+                let track_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cr.left + 14.0,
+                        top: bar_top,
+                        right: cr.right - 14.0,
+                        bottom: bar_top + 6.0,
+                    },
+                    radiusX: 3.0,
+                    radiusY: 3.0,
+                };
+                self.brush.SetColor(&pal.track);
+                self.brush.SetOpacity(1.0);
+                self.context.FillRoundedRectangle(&track_rect, &self.brush);
+
+                let fill_frac = if data.shows_remaining { 1.0 - used } else { used }.clamp(0.0, 1.0);
+                let fill_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cr.left + 14.0,
+                        top: bar_top,
+                        right: cr.left + 14.0 + bar_width * fill_frac,
+                        bottom: bar_top + 6.0,
+                    },
+                    radiusX: 3.0,
+                    radiusY: 3.0,
+                };
+                let col = tone_color(used, data.watch_limit, data.critical_limit, pal);
+                self.brush.SetColor(&col);
+                self.context.FillRoundedRectangle(&fill_rect, &self.brush);
+            }
+
+            let mut y = cr.top + 70.0;
             self.brush.SetColor(&pal.ink_dim);
             for line in &data.card_body {
                 let wide_line: Vec<u16> = line.encode_utf16().collect();
@@ -860,7 +954,7 @@ impl NotchRenderer {
                     left: cr.left + 14.0,
                     top: y,
                     right: cr.right - 14.0,
-                    bottom: y + 20.0,
+                    bottom: y + 18.0,
                 };
                 self.context.DrawText(
                     &wide_line,
@@ -876,6 +970,7 @@ impl NotchRenderer {
         Ok(())
     }
 
+    /// Constructs the curved trumpet tail wedge matching `clip-path: path('M0 0C0 8.18 16.36 12.43 28.2 16.36C16.36 20.29 0 24.54 0 32.72Z')`
     unsafe fn build_tail_path(&self, edge: &str, r: D2D_RECT_F) -> Result<ID2D1PathGeometry> {
         let (x0, y0, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
         let path = self.factory.CreatePathGeometry()?;
@@ -883,6 +978,7 @@ impl NotchRenderer {
 
         match edge {
             "left" => {
+                // Card on the right of the pill, tail points left
                 sink.BeginFigure(D2D_POINT_2F { x: x0 + w, y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
                 sink.AddBezier(&D2D1_BEZIER_SEGMENT {
                     point1: D2D_POINT_2F { x: x0 + w, y: y0 + h * 0.25 },
@@ -895,34 +991,8 @@ impl NotchRenderer {
                     point3: D2D_POINT_2F { x: x0 + w, y: y0 + h },
                 });
             }
-            "top" => {
-                sink.BeginFigure(D2D_POINT_2F { x: x0, y: y0 + h }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0 + w * 0.25, y: y0 + h },
-                    point2: D2D_POINT_2F { x: x0 + w * 0.38, y: y0 + h * 0.42 },
-                    point3: D2D_POINT_2F { x: x0 + w * 0.5, y: y0 },
-                });
-                sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0 + w * 0.62, y: y0 + h * 0.42 },
-                    point2: D2D_POINT_2F { x: x0 + w * 0.75, y: y0 + h },
-                    point3: D2D_POINT_2F { x: x0 + w, y: y0 + h },
-                });
-            }
-            "bottom" => {
-                sink.BeginFigure(D2D_POINT_2F { x: x0, y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0 + w * 0.25, y: y0 },
-                    point2: D2D_POINT_2F { x: x0 + w * 0.38, y: y0 + h * 0.58 },
-                    point3: D2D_POINT_2F { x: x0 + w * 0.5, y: y0 + h },
-                });
-                sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                    point1: D2D_POINT_2F { x: x0 + w * 0.62, y: y0 + h * 0.58 },
-                    point2: D2D_POINT_2F { x: x0 + w * 0.75, y: y0 },
-                    point3: D2D_POINT_2F { x: x0 + w, y: y0 },
-                });
-            }
             _ => {
-                // "right"
+                // "right": Card on the left of the pill, tail points right towards the ring
                 sink.BeginFigure(D2D_POINT_2F { x: x0, y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
                 sink.AddBezier(&D2D1_BEZIER_SEGMENT {
                     point1: D2D_POINT_2F { x: x0, y: y0 + h * 0.25 },

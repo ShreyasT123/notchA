@@ -142,7 +142,7 @@ impl NotchA {
         let notch_ui = notch_view::NotchUiState {
             edge: edge.clone(),
             scale,
-            dark,
+            dark: true,
             folded: cfg.notch_on_hover,
             ..Default::default()
         };
@@ -394,12 +394,7 @@ impl NotchA {
                         }
                     }
                     "pill_backdrop" => {
-                        self.notch_ui.behind = match payload.as_str() {
-                            Some("dark") => Some("dark".into()),
-                            Some("light") => Some("light".into()),
-                            _ => None,
-                        };
-                         self.notch_ui.anim.set_palette(self.notch_ui.behind.is_some(), Instant::now(), self.motion_on);
+                        // Notch is sleek dark mode only forever
                     }
                     _ => {}
                 }
@@ -408,9 +403,9 @@ impl NotchA {
             UiEvent::PlaceNotch => { self.glide = None; self.place_notch_task() }
             UiEvent::GlideNotch => self.glide_notch_task(),
             UiEvent::ApplyTheme => {
-                self.notch_ui.dark = core::resolved_theme(&self.app) != "light";
+                self.notch_ui.dark = true;
                 if let Some(w) = self.app.get_webview_window("settings") {
-                    settings_window::apply_mica(w.hwnd, self.notch_ui.dark);
+                    settings_window::apply_mica(w.hwnd, true);
                 }
                 Task::none()
             }
@@ -594,7 +589,11 @@ impl NotchA {
                     self.notch_ui.card_open = false;
                     self.notch_ui.anim.set_card(false, Instant::now(), self.motion_on);
                     core::EXPANDED.store(false, Ordering::Relaxed);
-                } else if layout.pill_rect.contains(p) {
+                } else if layout.pill_rect.contains(p) || (self.notch_ui.card_open && (if self.notch_ui.is_vertical() {
+                    p.x >= layout.pill_rect.x - 32.0 && p.x <= layout.pill_rect.x + layout.pill_rect.width + 12.0 && p.y >= layout.pill_rect.y - 12.0 && p.y <= layout.pill_rect.y + layout.pill_rect.height + 12.0
+                } else {
+                    p.x >= layout.pill_rect.x - 12.0 && p.x <= layout.pill_rect.x + layout.pill_rect.width + 12.0 && p.y >= layout.pill_rect.y - 32.0 && p.y <= layout.pill_rect.y + layout.pill_rect.height + 32.0
+                })) {
                     self.collapse_at = None;
                     let mut best: Option<(String, f32)> = None;
                     for (i, cell) in self.cells.iter().enumerate() {
@@ -605,14 +604,24 @@ impl NotchA {
                         }
                     }
                     if let Some((cid, _)) = best {
-                        self.notch_ui.hover_id = Some(cid);
+                        self.notch_ui.hover_id = Some(cid.clone());
+                        if let Some(idx) = self.cells.iter().position(|c| c.id == cid) {
+                            let target_pos = if self.notch_ui.is_vertical() {
+                                layout.ring_centers[idx].y
+                            } else {
+                                layout.ring_centers[idx].x
+                            };
+                            let target_h = notch_view::estimated_card_height(
+                                &self.cells[idx],
+                                &self.app.state::<AppState>().store.lock().unwrap().snapshot("en", "en", false, false),
+                                &self.app.state::<AppState>().activity.lock().unwrap(),
+                            );
+                            self.notch_ui.anim.retarget_card_pos(target_pos, target_h, !self.motion_on);
+                        }
                     }
                     self.notch_ui.card_open = true;
                     let now = Instant::now();
-                    if self.notch_ui.hover_id.as_deref() != self.last_card_id.as_deref() {
-                        self.last_card_id = self.notch_ui.hover_id.clone();
-                        self.notch_ui.anim.release(now, self.motion_on);
-                    }
+                    self.last_card_id = self.notch_ui.hover_id.clone();
                     self.notch_ui.anim.set_card(true, now, self.motion_on);
                     core::EXPANDED.store(true, Ordering::Relaxed);
                 } else if layout.card_rect.is_some_and(|r| r.contains(p)) || layout.tail_rect.is_some_and(|r| r.contains(p)) {
@@ -886,6 +895,8 @@ impl NotchA {
             || self.collapse_at.is_some()
             || self.fold_at.is_some()
             || self.notch_ui.anim.busy(Instant::now())
+            || self.notch_ui.orb_hovered
+            || self.notch_ui.grip_hovered
             || self.glide.is_some()
             || self.carry_ui.busy()
             || !self.reset_appear.done(Instant::now());

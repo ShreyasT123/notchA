@@ -238,6 +238,57 @@ pub struct NotchLayout {
     pub ring_centers: Vec<Point>,
     pub card_rect: Option<Rectangle>,
     pub tail_rect: Option<Rectangle>,
+    pub card_edge_pt: Option<Point>,
+    pub pill_edge_pt: Option<Point>,
+}
+
+pub fn cell_card_height(cell: &NotchCell) -> f32 {
+    let mut h: f32 = 32.0; // padding top (16) + bottom (16)
+    h += 24.0; // title row
+    h += 6.0; // spacing
+
+    if !cell.account_line.is_empty() {
+        h += 17.0;
+    }
+
+    let snap = &cell.snap;
+    if snap.status == "needsAuth" {
+        h += 62.0;
+    } else if snap.windows.is_empty() {
+        h += 24.0;
+    } else {
+        for w in &snap.windows {
+            if w.count.is_some() || w.amount.is_some() {
+                h += 34.0;
+            } else {
+                h += 46.0;
+            }
+        }
+        if !snap.note.is_empty() {
+            h += 18.0;
+        }
+    }
+    h.clamp(110.0, 340.0)
+}
+
+pub fn estimated_card_height(
+    cell: &NotchCell,
+    store_snap: &state::Snapshot,
+    acts: &[activity::Activity],
+) -> f32 {
+    let mut h = cell_card_height(cell);
+    if cell.base == "claude" {
+        let active_count = store_snap.sessions.iter().filter(|s| s.state != state::ST_IDLE).count().min(5);
+        if active_count > 0 {
+            h += 6.0 + active_count as f32 * 17.0;
+        }
+    } else {
+        let matching_count = acts.iter().filter(|a| a.provider == cell.base).count().min(5);
+        if matching_count > 0 {
+            h += 6.0 + matching_count as f32 * 17.0;
+        }
+    }
+    h.clamp(110.0, 340.0)
 }
 
 pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
@@ -332,6 +383,8 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
 
     let mut card_rect = None;
     let mut tail_rect = None;
+    let mut card_edge_pt = None;
+    let mut pill_edge_pt = None;
 
     if ui.anim.card_t > 0.001 && !ui.folded && !cells.is_empty() {
         let idx = ui
@@ -341,46 +394,76 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
             .unwrap_or(0);
         let rc = ring_centers[idx];
         let cw = 246.0f32;
-        let ch = 250.0f32;
-        let tail_gap = 10.5f32;
-        let tail_len = 28.2f32;
-        let tail_h = 32.7f32;
+        let ch = if ui.anim.card_h_t > 50.0 { ui.anim.card_h_t } else { cell_card_height(&cells[idx]) };
+        let tail_len = 22.0f32;
 
         if vert {
-            let top = (rc.y - ch / 2.0).clamp(8.0 + ui.insets[0], win_h - ui.insets[2] - ch - 8.0);
-            let x = if ui.edge == "left" {
-                pill_rect.x + pill_rect.width + tail_gap + tail_len
+            let rc_y = if ui.anim.card_pos_t > 0.1 { ui.anim.card_pos_t } else { rc.y };
+            let tail_y = if ui.anim.tail_pos_t > 0.1 { ui.anim.tail_pos_t } else { rc.y };
+
+            let top = (rc_y - ch / 2.0).clamp(8.0 + ui.insets[0], win_h - ui.insets[2] - ch - 8.0);
+            let (x, card_pt_x, pill_pt_x) = if ui.edge == "left" {
+                let x = pill_rect.x + pill_rect.width + tail_len;
+                (x, x, pill_rect.x + pill_rect.width)
             } else {
-                pill_rect.x - tail_gap - tail_len - cw
+                let x = pill_rect.x - tail_len - cw;
+                (x, x + cw, pill_rect.x)
             };
-            let ty = rc.y.clamp(top + 16.0 + tail_h / 2.0, (top + ch - 16.0 - tail_h / 2.0).max(top + 16.0 + tail_h / 2.0));
-            let tx = if ui.edge == "left" { x - tail_len } else { x + cw };
+
+            let ty = rc_y.clamp(top + 22.0, (top + ch - 22.0).max(top + 22.0));
+            card_edge_pt = Some(Point::new(card_pt_x, ty));
+            pill_edge_pt = Some(Point::new(pill_pt_x, tail_y));
+
             card_rect = Some(Rectangle::new(Point::new(x, top), Size::new(cw, ch)));
-            tail_rect = Some(Rectangle::new(Point::new(tx, ty - tail_h / 2.0), Size::new(tail_len, tail_h)));
-        } else {
-            let left = (rc.x - cw / 2.0).clamp(8.0 + ui.insets[3], win_w - ui.insets[1] - cw - 8.0);
-            let y = if ui.edge == "top" {
-                pill_rect.y + pill_rect.height + tail_gap + tail_len
+            let (tx, tw) = if ui.edge == "left" {
+                (pill_rect.x + pill_rect.width, tail_len)
             } else {
-                pill_rect.y - tail_gap - tail_len - ch
+                (x + cw, tail_len)
             };
-            let tx = rc.x.clamp(left + 16.0 + tail_h / 2.0, (left + cw - 16.0 - tail_h / 2.0).max(left + 16.0 + tail_h / 2.0));
-            let ty = if ui.edge == "top" { y - tail_len } else { y + ch };
+            let min_y = ty.min(tail_y) - 24.0;
+            let max_y = ty.max(tail_y) + 24.0;
+            tail_rect = Some(Rectangle::new(Point::new(tx, min_y), Size::new(tw, max_y - min_y)));
+        } else {
+            let rc_x = if ui.anim.card_pos_t > 0.1 { ui.anim.card_pos_t } else { rc.x };
+            let tail_x = if ui.anim.tail_pos_t > 0.1 { ui.anim.tail_pos_t } else { rc.x };
+
+            let left = (rc_x - cw / 2.0).clamp(8.0 + ui.insets[3], win_w - ui.insets[1] - cw - 8.0);
+            let (y, card_pt_y, pill_pt_y) = if ui.edge == "top" {
+                let y = pill_rect.y + pill_rect.height + tail_len;
+                (y, y, pill_rect.y + pill_rect.height)
+            } else {
+                let y = pill_rect.y - tail_len - ch;
+                (y, y + ch, pill_rect.y)
+            };
+
+            let tx = rc_x.clamp(left + 22.0, (left + cw - 22.0).max(left + 22.0));
+            card_edge_pt = Some(Point::new(tx, card_pt_y));
+            pill_edge_pt = Some(Point::new(tail_x, pill_pt_y));
+
             card_rect = Some(Rectangle::new(Point::new(left, y), Size::new(cw, ch)));
-            tail_rect = Some(Rectangle::new(Point::new(tx - tail_h / 2.0, ty), Size::new(tail_h, tail_len)));
+            let (ty, th) = if ui.edge == "top" {
+                (pill_rect.y + pill_rect.height, tail_len)
+            } else {
+                (y + ch, tail_len)
+            };
+            let min_x = tx.min(tail_x) - 24.0;
+            let max_x = tx.max(tail_x) + 24.0;
+            tail_rect = Some(Rectangle::new(Point::new(min_x, ty), Size::new(max_x - min_x, th)));
         }
     }
 
     if let (Some(cr), Some(tr)) = (card_rect, tail_rect) {
         let t = ui.anim.card_t.clamp(0.0, 1.0);
-        let (dx, dy) = match ui.edge.as_str() {
-            "left" => (-26.0, 0.0), "right" => (26.0, 0.0),
-            "top" => (0.0, -26.0), _ => (0.0, 26.0),
-        };
-        let from_card = Rectangle::new(Point::new(cr.x + dx, cr.y + dy), Size::new(cr.width * 0.94, cr.height * 0.94));
-        let from_tail = Rectangle::new(tr.position(), Size::new(tr.width * 0.6, tr.height * 0.6));
-        card_rect = Some(lerp_rect(from_card, cr, t));
-        tail_rect = Some(lerp_rect(from_tail, tr, t));
+        if t < 0.999 {
+            let (dx, dy) = match ui.edge.as_str() {
+                "left" => (-26.0, 0.0), "right" => (26.0, 0.0),
+                "top" => (0.0, -26.0), _ => (0.0, 26.0),
+            };
+            let from_card = Rectangle::new(Point::new(cr.x + dx, cr.y + dy), Size::new(cr.width * 0.94, cr.height * 0.94));
+            let from_tail = Rectangle::new(tr.position(), Size::new(tr.width * 0.6, tr.height * 0.6));
+            card_rect = Some(lerp_rect(from_card, cr, t));
+            tail_rect = Some(lerp_rect(from_tail, tr, t));
+        }
     }
     NotchLayout {
         pill_rect,
@@ -393,6 +476,8 @@ pub fn compute_layout(ui: &NotchUiState, cells: &[NotchCell]) -> NotchLayout {
         ring_centers,
         card_rect,
         tail_rect,
+        card_edge_pt,
+        pill_edge_pt,
     }
 }
 
@@ -466,15 +551,7 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
         let s = self.ui.scale;
         frame.scale(s);
 
-        let base = *theme::palette(self.ui.dark);
-        let mut pal = base;
-        if self.ui.behind.is_some() {
-            let other = *theme::palette(!self.ui.dark);
-            let t = self.ui.anim.palette_t.clamp(0.0, 1.0);
-            pal.pill = theme::lerp_color(base.pill, other.pill, t);
-            pal.edge = theme::lerp_color(base.edge, other.edge, t);
-            pal.rest_edge = theme::lerp_color(base.rest_edge, other.rest_edge, t);
-        }
+        let pal = *theme::palette(true);
 
         let fold = self.ui.anim.fold_t.clamp(0.0, 1.0);
 
@@ -494,17 +571,16 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
             return vec![frame.into_geometry()];
         }
 
-        // One opaque silhouette only. Overlapping translucent paths produced a
-        // tessellation seam that looked like a diagonally split pill.
+        // Clean seamless silhouette with pure cubic bezier contours (no diagonal partition)
         let morph_rect = lerp_rect(self.layout.pill_rect, self.layout.rest_rect, fold);
-        let pill_path = build_pill_contour(
+        let (fill_path, stroke_path) = build_pill_contours(
             &self.ui.edge,
             morph_rect,
             motion::lerp(20.0, 6.0, fold),
             motion::lerp(38.7, 6.0, fold),
         );
-        frame.fill(&pill_path, pal.pill);
-        frame.stroke(&pill_path, Stroke::default().with_color(pal.edge).with_width(1.0));
+        frame.fill(&fill_path, pal.pill);
+        frame.stroke(&stroke_path, Stroke::default().with_color(pal.edge).with_width(1.0));
 
         let reveal = 1.0 - fold;
         {
@@ -627,8 +703,8 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
 
             draw_orb_and_grip(&mut frame, &self.ui, &self.layout, &pal, reveal);
 
-            if let Some(tr) = self.layout.tail_rect {
-                let tail_path = build_tail_path(&self.ui.edge, tr);
+            if let (Some(cpt), Some(ppt)) = (self.layout.card_edge_pt, self.layout.pill_edge_pt) {
+                let tail_path = build_gooey_tail(&self.ui.edge, cpt, ppt, 42.0, 16.0, 7.0);
                 frame.fill(&tail_path, Color { a: self.ui.anim.card_t, ..pal.card });
             }
         }
@@ -636,92 +712,482 @@ impl canvas::Program<NotchMsg> for NotchCanvasProgram {
     }
 }
 
-fn build_pill_contour(edge: &str, r: Rectangle, rad: f32, f: f32) -> Path {
-    let mut b = path::Builder::new();
+const KAPPA: f32 = 0.55228475;
+
+fn build_pill_contours(edge: &str, r: Rectangle, rad: f32, f: f32) -> (Path, Path) {
+    let mut fill_b = path::Builder::new();
+    let mut stroke_b = path::Builder::new();
+
     match edge {
         "left" => {
             let (x0, x1, y0, y1) = (r.x, r.x + r.width, r.y, r.y + r.height);
-            b.move_to(Point::new(x0 - 2.0, y0 - f));
-            b.line_to(Point::new(x0, y0 - f));
-            b.arc(path::Arc { center: Point::new(x0 + f, y0 - f), radius: f, start_angle: Radians(PI), end_angle: Radians(FRAC_PI_2) });
-            b.line_to(Point::new(x1 - rad, y0));
-            b.quadratic_curve_to(Point::new(x1, y0), Point::new(x1, y0 + rad));
-            b.line_to(Point::new(x1, y1 - rad));
-            b.quadratic_curve_to(Point::new(x1, y1), Point::new(x1 - rad, y1));
-            b.line_to(Point::new(x0 + f, y1));
-            b.arc(path::Arc { center: Point::new(x0 + f, y1 + f), radius: f, start_angle: Radians(-FRAC_PI_2), end_angle: Radians(PI) });
-            b.line_to(Point::new(x0 - 2.0, y1 + f));
+            let start = Point::new(x0, y0 - f);
+            fill_b.move_to(start);
+            stroke_b.move_to(start);
+
+            // Top fillet: concave curve into the pill
+            let cp1 = Point::new(x0, y0 - f + f * KAPPA);
+            let cp2 = Point::new(x0 + f - f * KAPPA, y0);
+            let p1 = Point::new(x0 + f, y0);
+            fill_b.bezier_curve_to(cp1, cp2, p1);
+            stroke_b.bezier_curve_to(cp1, cp2, p1);
+
+            // Top edge
+            let p2 = Point::new(x1 - rad, y0);
+            fill_b.line_to(p2);
+            stroke_b.line_to(p2);
+
+            // Top-right corner
+            let cp3 = Point::new(x1 - rad + rad * KAPPA, y0);
+            let cp4 = Point::new(x1, y0 + rad - rad * KAPPA);
+            let p3 = Point::new(x1, y0 + rad);
+            fill_b.bezier_curve_to(cp3, cp4, p3);
+            stroke_b.bezier_curve_to(cp3, cp4, p3);
+
+            // Right vertical outer edge
+            let p4 = Point::new(x1, y1 - rad);
+            fill_b.line_to(p4);
+            stroke_b.line_to(p4);
+
+            // Bottom-right corner
+            let cp5 = Point::new(x1, y1 - rad + rad * KAPPA);
+            let cp6 = Point::new(x1 - rad + rad * KAPPA, y1);
+            let p5 = Point::new(x1 - rad, y1);
+            fill_b.bezier_curve_to(cp5, cp6, p5);
+            stroke_b.bezier_curve_to(cp5, cp6, p5);
+
+            // Bottom edge
+            let p6 = Point::new(x0 + f, y1);
+            fill_b.line_to(p6);
+            stroke_b.line_to(p6);
+
+            // Bottom fillet: concave curve to the screen edge
+            let cp7 = Point::new(x0 + f - f * KAPPA, y1);
+            let cp8 = Point::new(x0, y1 + f - f * KAPPA);
+            let end_stroke = Point::new(x0, y1 + f);
+            fill_b.bezier_curve_to(cp7, cp8, end_stroke);
+            stroke_b.bezier_curve_to(cp7, cp8, end_stroke);
+
+            fill_b.line_to(start);
+            fill_b.close();
         }
         "top" => {
             let (x0, x1, y0, y1) = (r.x, r.x + r.width, r.y, r.y + r.height);
-            b.move_to(Point::new(x0 - f, y0 - 2.0));
-            b.line_to(Point::new(x0 - f, y0));
-            b.arc(path::Arc { center: Point::new(x0 - f, y0 + f), radius: f, start_angle: Radians(-FRAC_PI_2), end_angle: Radians(0.0) });
-            b.line_to(Point::new(x0, y1 - rad));
-            b.quadratic_curve_to(Point::new(x0, y1), Point::new(x0 + rad, y1));
-            b.line_to(Point::new(x1 - rad, y1));
-            b.quadratic_curve_to(Point::new(x1, y1), Point::new(x1, y1 - rad));
-            b.line_to(Point::new(x1, y0 + f));
-            b.arc(path::Arc { center: Point::new(x1 + f, y0 + f), radius: f, start_angle: Radians(PI), end_angle: Radians(-FRAC_PI_2) });
-            b.line_to(Point::new(x1 + f, y0 - 2.0));
+            let start = Point::new(x0 - f, y0);
+            fill_b.move_to(start);
+            stroke_b.move_to(start);
+
+            // Left fillet: concave curve into the pill
+            let cp1 = Point::new(x0 - f + f * KAPPA, y0);
+            let cp2 = Point::new(x0, y0 + f - f * KAPPA);
+            let p1 = Point::new(x0, y0 + f);
+            fill_b.bezier_curve_to(cp1, cp2, p1);
+            stroke_b.bezier_curve_to(cp1, cp2, p1);
+
+            // Left edge
+            let p2 = Point::new(x0, y1 - rad);
+            fill_b.line_to(p2);
+            stroke_b.line_to(p2);
+
+            // Bottom-left corner
+            let cp3 = Point::new(x0, y1 - rad + rad * KAPPA);
+            let cp4 = Point::new(x0 + rad - rad * KAPPA, y1);
+            let p3 = Point::new(x0 + rad, y1);
+            fill_b.bezier_curve_to(cp3, cp4, p3);
+            stroke_b.bezier_curve_to(cp3, cp4, p3);
+
+            // Bottom outer horizontal edge
+            let p4 = Point::new(x1 - rad, y1);
+            fill_b.line_to(p4);
+            stroke_b.line_to(p4);
+
+            // Bottom-right corner
+            let cp5 = Point::new(x1 - rad + rad * KAPPA, y1);
+            let cp6 = Point::new(x1, y1 - rad + rad * KAPPA);
+            let p5 = Point::new(x1, y1 - rad);
+            fill_b.bezier_curve_to(cp5, cp6, p5);
+            stroke_b.bezier_curve_to(cp5, cp6, p5);
+
+            // Right edge
+            let p6 = Point::new(x1, y0 + f);
+            fill_b.line_to(p6);
+            stroke_b.line_to(p6);
+
+            // Right fillet: concave curve to the screen edge
+            let cp7 = Point::new(x1, y0 + f - f * KAPPA);
+            let cp8 = Point::new(x1 + f - f * KAPPA, y0);
+            let end_stroke = Point::new(x1 + f, y0);
+            fill_b.bezier_curve_to(cp7, cp8, end_stroke);
+            stroke_b.bezier_curve_to(cp7, cp8, end_stroke);
+
+            fill_b.line_to(start);
+            fill_b.close();
         }
         "bottom" => {
             let (x0, x1, y0, y1) = (r.x, r.x + r.width, r.y, r.y + r.height);
-            b.move_to(Point::new(x0 - f, y1 + 2.0));
-            b.line_to(Point::new(x0 - f, y1));
-            b.arc(path::Arc { center: Point::new(x0 - f, y1 - f), radius: f, start_angle: Radians(FRAC_PI_2), end_angle: Radians(0.0) });
-            b.line_to(Point::new(x0, y0 + rad));
-            b.quadratic_curve_to(Point::new(x0, y0), Point::new(x0 + rad, y0));
-            b.line_to(Point::new(x1 - rad, y0));
-            b.quadratic_curve_to(Point::new(x1, y0), Point::new(x1, y0 + rad));
-            b.line_to(Point::new(x1, y1 - f));
-            b.arc(path::Arc { center: Point::new(x1 + f, y1 - f), radius: f, start_angle: Radians(PI), end_angle: Radians(FRAC_PI_2) });
-            b.line_to(Point::new(x1 + f, y1 + 2.0));
+            let start = Point::new(x0 - f, y1);
+            fill_b.move_to(start);
+            stroke_b.move_to(start);
+
+            // Left fillet: concave curve into the pill
+            let cp1 = Point::new(x0 - f + f * KAPPA, y1);
+            let cp2 = Point::new(x0, y1 - f + f * KAPPA);
+            let p1 = Point::new(x0, y1 - f);
+            fill_b.bezier_curve_to(cp1, cp2, p1);
+            stroke_b.bezier_curve_to(cp1, cp2, p1);
+
+            // Left edge
+            let p2 = Point::new(x0, y0 + rad);
+            fill_b.line_to(p2);
+            stroke_b.line_to(p2);
+
+            // Top-left corner
+            let cp3 = Point::new(x0, y0 + rad - rad * KAPPA);
+            let cp4 = Point::new(x0 + rad - rad * KAPPA, y0);
+            let p3 = Point::new(x0 + rad, y0);
+            fill_b.bezier_curve_to(cp3, cp4, p3);
+            stroke_b.bezier_curve_to(cp3, cp4, p3);
+
+            // Top outer horizontal edge
+            let p4 = Point::new(x1 - rad, y0);
+            fill_b.line_to(p4);
+            stroke_b.line_to(p4);
+
+            // Top-right corner
+            let cp5 = Point::new(x1 - rad + rad * KAPPA, y0);
+            let cp6 = Point::new(x1, y0 + rad - rad * KAPPA);
+            let p5 = Point::new(x1, y0 + rad);
+            fill_b.bezier_curve_to(cp5, cp6, p5);
+            stroke_b.bezier_curve_to(cp5, cp6, p5);
+
+            // Right edge
+            let p6 = Point::new(x1, y1 - f);
+            fill_b.line_to(p6);
+            stroke_b.line_to(p6);
+
+            // Right fillet: concave curve to the screen edge
+            let cp7 = Point::new(x1, y1 - f + f * KAPPA);
+            let cp8 = Point::new(x1 + f - f * KAPPA, y1);
+            let end_stroke = Point::new(x1 + f, y1);
+            fill_b.bezier_curve_to(cp7, cp8, end_stroke);
+            stroke_b.bezier_curve_to(cp7, cp8, end_stroke);
+
+            fill_b.line_to(start);
+            fill_b.close();
         }
         _ => {
+            // "right"
             let (x0, x1, y0, y1) = (r.x, r.x + r.width, r.y, r.y + r.height);
-            b.move_to(Point::new(x1 + 2.0, y0 - f));
-            b.line_to(Point::new(x1, y0 - f));
-            b.arc(path::Arc { center: Point::new(x1 - f, y0 - f), radius: f, start_angle: Radians(0.0), end_angle: Radians(FRAC_PI_2) });
-            b.line_to(Point::new(x0 + rad, y0));
-            b.quadratic_curve_to(Point::new(x0, y0), Point::new(x0, y0 + rad));
-            b.line_to(Point::new(x0, y1 - rad));
-            b.quadratic_curve_to(Point::new(x0, y1), Point::new(x0 + rad, y1));
-            b.line_to(Point::new(x1 - f, y1));
-            b.arc(path::Arc { center: Point::new(x1 - f, y1 + f), radius: f, start_angle: Radians(-FRAC_PI_2), end_angle: Radians(0.0) });
-            b.line_to(Point::new(x1 + 2.0, y1 + f));
+            let start = Point::new(x1, y0 - f);
+            fill_b.move_to(start);
+            stroke_b.move_to(start);
+
+            // Top fillet: concave curve into the pill
+            let cp1 = Point::new(x1, y0 - f + f * KAPPA);
+            let cp2 = Point::new(x1 - f + f * KAPPA, y0);
+            let p1 = Point::new(x1 - f, y0);
+            fill_b.bezier_curve_to(cp1, cp2, p1);
+            stroke_b.bezier_curve_to(cp1, cp2, p1);
+
+            // Top edge
+            let p2 = Point::new(x0 + rad, y0);
+            fill_b.line_to(p2);
+            stroke_b.line_to(p2);
+
+            // Top-left corner
+            let cp3 = Point::new(x0 + rad - rad * KAPPA, y0);
+            let cp4 = Point::new(x0, y0 + rad - rad * KAPPA);
+            let p3 = Point::new(x0, y0 + rad);
+            fill_b.bezier_curve_to(cp3, cp4, p3);
+            stroke_b.bezier_curve_to(cp3, cp4, p3);
+
+            // Left vertical outer edge
+            let p4 = Point::new(x0, y1 - rad);
+            fill_b.line_to(p4);
+            stroke_b.line_to(p4);
+
+            // Bottom-left corner
+            let cp5 = Point::new(x0, y1 - rad + rad * KAPPA);
+            let cp6 = Point::new(x0 + rad - rad * KAPPA, y1);
+            let p5 = Point::new(x0 + rad, y1);
+            fill_b.bezier_curve_to(cp5, cp6, p5);
+            stroke_b.bezier_curve_to(cp5, cp6, p5);
+
+            // Bottom edge
+            let p6 = Point::new(x1 - f, y1);
+            fill_b.line_to(p6);
+            stroke_b.line_to(p6);
+
+            // Bottom fillet: concave curve to the screen edge
+            let cp7 = Point::new(x1 - f + f * KAPPA, y1);
+            let cp8 = Point::new(x1, y1 + f - f * KAPPA);
+            let end_stroke = Point::new(x1, y1 + f);
+            fill_b.bezier_curve_to(cp7, cp8, end_stroke);
+            stroke_b.bezier_curve_to(cp7, cp8, end_stroke);
+
+            // Fill closes along the screen edge; stroke ends open without drawing on the bezel
+            fill_b.line_to(start);
+            fill_b.close();
+        }
+    }
+
+    (fill_b.build(), stroke_b.build())
+}
+
+/// Builds the curved "trumpet" tail wedge that bridges a detached card to the
+/// notch pill. Mirrors the native Direct2D `build_tail_path` so the Iced card
+/// keeps the same silhouette on every edge.
+pub fn build_tail_path(edge: &str, r: Rectangle) -> Path {
+    let mut b = path::Builder::new();
+    let (x0, y0, w, h) = (r.x, r.y, r.width, r.height);
+
+    match edge {
+        "left" => {
+            // Pill on the left, card on the right: flat base on the right, tip pointing left.
+            b.move_to(Point::new(x0 + w, y0));
+            b.bezier_curve_to(
+                Point::new(x0 + w, y0 + h * 0.25),
+                Point::new(x0 + w * 0.42, y0 + h * 0.38),
+                Point::new(x0, y0 + h * 0.5),
+            );
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.42, y0 + h * 0.62),
+                Point::new(x0 + w, y0 + h * 0.75),
+                Point::new(x0 + w, y0 + h),
+            );
+        }
+        "top" => {
+            // Pill at the top, card below: flat base at the bottom, tip pointing up.
+            b.move_to(Point::new(x0, y0 + h));
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.25, y0 + h),
+                Point::new(x0 + w * 0.38, y0 + h * 0.42),
+                Point::new(x0 + w * 0.5, y0),
+            );
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.62, y0 + h * 0.42),
+                Point::new(x0 + w * 0.75, y0 + h),
+                Point::new(x0 + w, y0 + h),
+            );
+        }
+        "bottom" => {
+            // Pill at the bottom, card above: flat base at the top, tip pointing down.
+            b.move_to(Point::new(x0, y0));
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.25, y0),
+                Point::new(x0 + w * 0.38, y0 + h * 0.58),
+                Point::new(x0 + w * 0.5, y0 + h),
+            );
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.62, y0 + h * 0.58),
+                Point::new(x0 + w * 0.75, y0),
+                Point::new(x0 + w, y0),
+            );
+        }
+        _ => {
+            // "right": card on the left, pill on the right: flat base on the left, tip pointing right.
+            b.move_to(Point::new(x0, y0));
+            b.bezier_curve_to(
+                Point::new(x0, y0 + h * 0.25),
+                Point::new(x0 + w * 0.58, y0 + h * 0.38),
+                Point::new(x0 + w, y0 + h * 0.5),
+            );
+            b.bezier_curve_to(
+                Point::new(x0 + w * 0.58, y0 + h * 0.62),
+                Point::new(x0, y0 + h * 0.75),
+                Point::new(x0, y0 + h),
+            );
         }
     }
     b.close();
     b.build()
 }
 
-pub fn build_tail_path(edge: &str, r: Rectangle) -> Path {
+pub fn build_gooey_tail(
+    edge: &str,
+    card_pt: Point,
+    pill_pt: Point,
+    base_h: f32,
+    waist_h: f32,
+    tip_r: f32,
+) -> Path {
     let mut b = path::Builder::new();
     match edge {
         "left" => {
-            let (x0, y0, w, h) = (r.x, r.y, r.width, r.height);
-            b.move_to(Point::new(x0 + w, y0));
-            b.bezier_curve_to(Point::new(x0 + w, y0 + h * 0.25), Point::new(x0 + w * 0.42, y0 + h * 0.38), Point::new(x0, y0 + h * 0.5));
-            b.bezier_curve_to(Point::new(x0 + w * 0.42, y0 + h * 0.62), Point::new(x0 + w, y0 + h * 0.75), Point::new(x0 + w, y0 + h));
+            // Pill on left, card on right
+            let dx = pill_pt.x - card_pt.x; // negative
+            let dy = pill_pt.y - card_pt.y;
+
+            let p_top_base = Point::new(card_pt.x, card_pt.y - base_h * 0.5);
+            let p_bot_base = Point::new(card_pt.x, card_pt.y + base_h * 0.5);
+
+            let mx = card_pt.x + dx * 0.44;
+            let my = card_pt.y + dy * 0.65;
+            let m_top = Point::new(mx, my - waist_h * 0.5);
+            let m_bot = Point::new(mx, my + waist_h * 0.5);
+
+            let tip_top = Point::new(pill_pt.x + tip_r * 0.85, pill_pt.y - tip_r * 0.9);
+            let tip_bot = Point::new(pill_pt.x + tip_r * 0.85, pill_pt.y + tip_r * 0.9);
+
+            b.move_to(p_top_base);
+            b.bezier_curve_to(
+                Point::new(card_pt.x + dx * 0.18, card_pt.y - base_h * 0.45),
+                Point::new(mx - dx * 0.16, my - waist_h * 0.52),
+                m_top,
+            );
+            b.bezier_curve_to(
+                Point::new(mx + dx * 0.22, my - waist_h * 0.45),
+                Point::new(pill_pt.x + tip_r * 1.2, pill_pt.y - tip_r * 0.95),
+                tip_top,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x - tip_r * 0.35, pill_pt.y - tip_r * 0.45),
+                Point::new(pill_pt.x - tip_r * 0.35, pill_pt.y + tip_r * 0.45),
+                tip_bot,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x + tip_r * 1.2, pill_pt.y + tip_r * 0.95),
+                Point::new(mx + dx * 0.22, my + waist_h * 0.45),
+                m_bot,
+            );
+            b.bezier_curve_to(
+                Point::new(mx - dx * 0.16, my + waist_h * 0.52),
+                Point::new(card_pt.x + dx * 0.18, card_pt.y + base_h * 0.45),
+                p_bot_base,
+            );
+            b.line_to(p_top_base);
         }
         "top" => {
-            let (x0, y0, w, h) = (r.x, r.y, r.width, r.height);
-            b.move_to(Point::new(x0, y0 + h));
-            b.bezier_curve_to(Point::new(x0 + w * 0.25, y0 + h), Point::new(x0 + w * 0.38, y0 + h * 0.42), Point::new(x0 + w * 0.5, y0));
-            b.bezier_curve_to(Point::new(x0 + w * 0.62, y0 + h * 0.42), Point::new(x0 + w * 0.75, y0 + h), Point::new(x0 + w, y0 + h));
+            // Pill at top, card below
+            let dx = pill_pt.x - card_pt.x;
+            let dy = pill_pt.y - card_pt.y; // negative
+
+            let p_left_base = Point::new(card_pt.x - base_h * 0.5, card_pt.y);
+            let p_right_base = Point::new(card_pt.x + base_h * 0.5, card_pt.y);
+
+            let mx = card_pt.x + dx * 0.65;
+            let my = card_pt.y + dy * 0.44;
+            let m_left = Point::new(mx - waist_h * 0.5, my);
+            let m_right = Point::new(mx + waist_h * 0.5, my);
+
+            let tip_left = Point::new(pill_pt.x - tip_r * 0.9, pill_pt.y + tip_r * 0.85);
+            let tip_right = Point::new(pill_pt.x + tip_r * 0.9, pill_pt.y + tip_r * 0.85);
+
+            b.move_to(p_left_base);
+            b.bezier_curve_to(
+                Point::new(card_pt.x - base_h * 0.45, card_pt.y + dy * 0.18),
+                Point::new(mx - waist_h * 0.52, my - dy * 0.16),
+                m_left,
+            );
+            b.bezier_curve_to(
+                Point::new(mx - waist_h * 0.45, my + dy * 0.22),
+                Point::new(pill_pt.x - tip_r * 0.95, pill_pt.y + tip_r * 1.2),
+                tip_left,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x - tip_r * 0.45, pill_pt.y - tip_r * 0.35),
+                Point::new(pill_pt.x + tip_r * 0.45, pill_pt.y - tip_r * 0.35),
+                tip_right,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x + tip_r * 0.95, pill_pt.y + tip_r * 1.2),
+                Point::new(mx + waist_h * 0.45, my + dy * 0.22),
+                m_right,
+            );
+            b.bezier_curve_to(
+                Point::new(mx + waist_h * 0.52, my - dy * 0.16),
+                Point::new(card_pt.x + base_h * 0.45, card_pt.y + dy * 0.18),
+                p_right_base,
+            );
+            b.line_to(p_left_base);
         }
         "bottom" => {
-            let (x0, y0, w, h) = (r.x, r.y, r.width, r.height);
-            b.move_to(Point::new(x0, y0));
-            b.bezier_curve_to(Point::new(x0 + w * 0.25, y0), Point::new(x0 + w * 0.38, y0 + h * 0.58), Point::new(x0 + w * 0.5, y0 + h));
-            b.bezier_curve_to(Point::new(x0 + w * 0.62, y0 + h * 0.58), Point::new(x0 + w * 0.75, y0), Point::new(x0 + w, y0));
+            // Pill at bottom, card above
+            let dx = pill_pt.x - card_pt.x;
+            let dy = pill_pt.y - card_pt.y; // positive
+
+            let p_left_base = Point::new(card_pt.x - base_h * 0.5, card_pt.y);
+            let p_right_base = Point::new(card_pt.x + base_h * 0.5, card_pt.y);
+
+            let mx = card_pt.x + dx * 0.65;
+            let my = card_pt.y + dy * 0.44;
+            let m_left = Point::new(mx - waist_h * 0.5, my);
+            let m_right = Point::new(mx + waist_h * 0.5, my);
+
+            let tip_left = Point::new(pill_pt.x - tip_r * 0.9, pill_pt.y - tip_r * 0.85);
+            let tip_right = Point::new(pill_pt.x + tip_r * 0.9, pill_pt.y - tip_r * 0.85);
+
+            b.move_to(p_left_base);
+            b.bezier_curve_to(
+                Point::new(card_pt.x - base_h * 0.45, card_pt.y + dy * 0.18),
+                Point::new(mx - waist_h * 0.52, my - dy * 0.16),
+                m_left,
+            );
+            b.bezier_curve_to(
+                Point::new(mx - waist_h * 0.45, my + dy * 0.22),
+                Point::new(pill_pt.x - tip_r * 0.95, pill_pt.y - tip_r * 1.2),
+                tip_left,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x - tip_r * 0.45, pill_pt.y + tip_r * 0.35),
+                Point::new(pill_pt.x + tip_r * 0.45, pill_pt.y + tip_r * 0.35),
+                tip_right,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x + tip_r * 0.95, pill_pt.y - tip_r * 1.2),
+                Point::new(mx + waist_h * 0.45, my + dy * 0.22),
+                m_right,
+            );
+            b.bezier_curve_to(
+                Point::new(mx + waist_h * 0.52, my - dy * 0.16),
+                Point::new(card_pt.x + base_h * 0.45, card_pt.y + dy * 0.18),
+                p_right_base,
+            );
+            b.line_to(p_left_base);
         }
         _ => {
-            let (x0, y0, w, h) = (r.x, r.y, r.width, r.height);
-            b.move_to(Point::new(x0, y0));
-            b.bezier_curve_to(Point::new(x0, y0 + h * 0.25), Point::new(x0 + w * 0.58, y0 + h * 0.38), Point::new(x0 + w, y0 + h * 0.5));
-            b.bezier_curve_to(Point::new(x0 + w * 0.58, y0 + h * 0.62), Point::new(x0, y0 + h * 0.75), Point::new(x0, y0 + h));
+            // Pill on right, card on left
+            let dx = pill_pt.x - card_pt.x; // positive
+            let dy = pill_pt.y - card_pt.y;
+
+            let p_top_base = Point::new(card_pt.x, card_pt.y - base_h * 0.5);
+            let p_bot_base = Point::new(card_pt.x, card_pt.y + base_h * 0.5);
+
+            let mx = card_pt.x + dx * 0.44;
+            let my = card_pt.y + dy * 0.65;
+            let m_top = Point::new(mx, my - waist_h * 0.5);
+            let m_bot = Point::new(mx, my + waist_h * 0.5);
+
+            let tip_top = Point::new(pill_pt.x - tip_r * 0.85, pill_pt.y - tip_r * 0.9);
+            let tip_bot = Point::new(pill_pt.x - tip_r * 0.85, pill_pt.y + tip_r * 0.9);
+
+            b.move_to(p_top_base);
+            b.bezier_curve_to(
+                Point::new(card_pt.x + dx * 0.18, card_pt.y - base_h * 0.45),
+                Point::new(mx - dx * 0.16, my - waist_h * 0.52),
+                m_top,
+            );
+            b.bezier_curve_to(
+                Point::new(mx + dx * 0.22, my - waist_h * 0.45),
+                Point::new(pill_pt.x - tip_r * 1.2, pill_pt.y - tip_r * 0.95),
+                tip_top,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x + tip_r * 0.35, pill_pt.y - tip_r * 0.45),
+                Point::new(pill_pt.x + tip_r * 0.35, pill_pt.y + tip_r * 0.45),
+                tip_bot,
+            );
+            b.bezier_curve_to(
+                Point::new(pill_pt.x - tip_r * 1.2, pill_pt.y + tip_r * 0.95),
+                Point::new(mx + dx * 0.22, my + waist_h * 0.45),
+                m_bot,
+            );
+            b.bezier_curve_to(
+                Point::new(mx - dx * 0.16, my + waist_h * 0.52),
+                Point::new(card_pt.x + dx * 0.18, card_pt.y + base_h * 0.45),
+                p_bot_base,
+            );
+            b.line_to(p_top_base);
         }
     }
     b.close();
@@ -785,44 +1251,62 @@ fn draw_orb_and_grip(
 ) {
     let c = layout.orb_center;
     let hover = ui.anim.orb_t.clamp(0.0, 1.0);
-    let out = ui.anim.grip_out.clamp(0.0, 1.0);
     let a = reveal;
 
-    if hover > 0.001 {
-        let r = 23.3 * hover;
-        let disc = goo::disc(c, r);
-        frame.fill(&disc, Color { a: hover * a, ..pal.pill });
-        frame.stroke(&disc, Stroke::default().with_color(Color { a: hover * a, ..pal.edge }).with_width(1.0));
+    // By default, the arc rests pointing top-right (no continuous spin!).
+    let start_turns = match ui.edge.as_str() {
+        "left" => 0.75,
+        "top" => 0.5,
+        "bottom" => 0.25,
+        _ => 0.0,
+    };
 
-        if out > 0.01 {
-            let vert = ui.is_vertical();
-            let reach = 9.9 * out;
-            let dots = goo::grip_dots(layout.grip_center, reach, vert);
-            let dot_r = 3.05 * (1.0 + 0.3 * ui.anim.orb_t);
-            let neck = goo::strand(c, layout.grip_center, r * 0.9, 8.5 * out, out);
-            frame.fill(&neck, Color { a: out * a, ..pal.pill });
-            for p in goo::disc_merge(layout.grip_center, &dots, 8.5 * out, dot_r, out) {
-                frame.fill(&p, Color { a: out * a, ..pal.pill });
-                frame.stroke(&p, Stroke::default().with_color(Color { a: out * a, ..pal.edge }).with_width(0.9));
-            }
-        }
+    // The arc does NOT spin!
+    // At rest (hover = 0.0), it spans 0.28 turns (quarter arc in top-right quadrant).
+    // As hover increases, it morphs into the full closed circle (span -> 1.0)!
+    let arc_radius = 21.0;
+    let arc_span = motion::lerp(0.28, 1.0, hover);
+    let arc_path = goo::quarter(c, arc_radius, start_turns, arc_span);
 
-        if ui.anim.release_t > 0.01 && out < 0.6 {
-            let arc = goo::release_arc(c, 28.5, ui.anim.release_t);
-            frame.stroke(&arc, Stroke::default().with_color(Color { a: (1.0 - out) * a, ..pal.edge }).with_width(2.2).with_line_cap(LineCap::Round));
-        }
+    // Dark settings circle disc inside the morphing arc (fades in as arc morphs into circle)
+    if hover > 0.01 {
+        let disc = Path::circle(c, arc_radius);
+        frame.fill(&disc, Color { a: hover * 0.95 * a, ..pal.pill });
     }
 
-    if hover < 0.999 {
-        let start_turns = match ui.edge.as_str() {
-            "left" | "top" => 0.5,
-            "bottom" => 0.25,
-            _ => 0.75,
+    // Arc stroke that expands to complete the circle outline
+    let arc_color = if hover > 0.05 {
+        Color { a: motion::lerp(0.65, 0.95, hover) * a, ..pal.ink }
+    } else {
+        Color { a: 0.65 * a, ..pal.edge }
+    };
+    let arc_width = if hover > 0.05 { 2.4 } else { 2.0 };
+    frame.stroke(
+        &arc_path,
+        Stroke::default()
+            .with_color(arc_color)
+            .with_width(arc_width)
+            .with_line_cap(LineCap::Round),
+    );
+
+    // Drag-drop handle: JUST 6 DOTS (NO PILL CAPSULE)
+    // Spawns/emerges directly from the settings circle!
+    let out = ui.anim.grip_out.clamp(0.0, 1.0);
+    if out > 0.01 {
+        let vert = ui.is_vertical();
+        let reach = 9.9 * out;
+        let spawn_center = if vert {
+            Point::new(c.x, motion::lerp(c.y + arc_radius * 0.5, layout.grip_center.y, out))
+        } else {
+            Point::new(motion::lerp(c.x + arc_radius * 0.5, layout.grip_center.x, out), c.y)
         };
-        let rest_a = (1.0 - hover) * a;
-        let q = goo::quarter(c, 28.5, start_turns, 0.25);
-        frame.stroke(&q, Stroke::default().with_color(Color { a: rest_a, ..pal.edge }).with_width(8.8).with_line_cap(LineCap::Round));
-        frame.stroke(&q, Stroke::default().with_color(Color { a: rest_a, ..pal.pill }).with_width(6.8).with_line_cap(LineCap::Round));
+        let dots = goo::grip_dots(spawn_center, reach, vert);
+        let dot_r = 2.4;
+
+        // Render purely the 6 dots - no pill capsule background or border
+        for pt in &dots {
+            frame.fill(&Path::circle(*pt, dot_r), Color { a: out * 0.85 * a, ..pal.ink_4 });
+        }
     }
 }
 
@@ -907,21 +1391,22 @@ pub fn view<'a>(
             );
         }
 
-        // Gear icon when hovered
-        if ui.anim.orb_t > 0.45 {
+        // Gear icon when hovered (options) - fades into the circle
+        if ui.anim.orb_t > 0.05 {
             let gear_svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M10.03 4.66L10.14 1.97 A10.20 10.20 0 0 1 13.86 1.97 L13.97 4.66A7.60 7.60 0 0 1 15.80 5.42L17.78 3.59 A10.20 10.20 0 0 1 20.41 6.22 L18.58 8.20A7.60 7.60 0 0 1 19.34 10.03L22.03 10.14 A10.20 10.20 0 0 1 22.03 13.86 L19.34 13.97A7.60 7.60 0 0 1 18.58 15.80L20.41 17.78 A10.20 10.20 0 0 1 17.78 20.41 L15.80 18.58A7.60 7.60 0 0 1 13.97 19.34L13.86 22.03 A10.20 10.20 0 0 1 10.14 22.03 L10.03 19.34A7.60 7.60 0 0 1 8.20 18.58L6.22 20.41 A10.20 10.20 0 0 1 3.59 17.78 L5.42 15.80A7.60 7.60 0 0 1 4.66 13.97L1.97 13.86 A10.20 10.20 0 0 1 1.97 10.14 L4.66 10.03A7.60 7.60 0 0 1 5.42 8.20L3.59 6.22 A10.20 10.20 0 0 1 6.22 3.59 L8.20 5.42A7.60 7.60 0 0 1 10.03 4.66 ZM7.90 12a4.10 4.10 0 1 0 8.20 0a4.10 4.10 0 1 0 -8.20 0Z"/></svg>"#;
-            let gear_alpha = ((ui.anim.orb_t - 0.45) / 0.55).clamp(0.0, 1.0);
+            let gear_alpha = ((ui.anim.orb_t - 0.05) / 0.95).clamp(0.0, 1.0);
+            let gear_size = 17.0 * s;
             let gear = svg(svg::Handle::from_memory(gear_svg.as_slice()))
-                .width(Length::Fixed(21.0 * s))
-                .height(Length::Fixed(21.0 * s))
+                .width(Length::Fixed(gear_size))
+                .height(Length::Fixed(gear_size))
                 .style(move |_, _| svg::Style { color: Some(Color { a: gear_alpha, ..pal.ink_2 }) });
             layers.push(
                 container(gear)
                     .width(Length::Fixed(win_w))
                     .height(Length::Fixed(win_h))
                     .padding(Padding {
-                        top: (layout.orb_center.y - 10.5) * s,
-                        left: (layout.orb_center.x - 10.5) * s,
+                        top: (layout.orb_center.y - 8.5) * s,
+                        left: (layout.orb_center.x - 8.5) * s,
                         ..Padding::ZERO
                     })
                     .into(),

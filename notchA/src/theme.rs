@@ -82,8 +82,8 @@ pub const LIGHT: Palette = Palette {
     btn_line_hover: hex(0x8e8e93),
 };
 
-pub fn palette(dark: bool) -> &'static Palette {
-    if dark { &DARK } else { &LIGHT }
+pub fn palette(_dark: bool) -> &'static Palette {
+    &DARK
 }
 
 pub fn tone(

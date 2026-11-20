@@ -40,6 +40,7 @@ impl canvas::Program<ResetMsg> for TailCanvas {
         };
         let path = build_tail_path(&self.edge, tail_rect);
         frame.fill(&path, pal.card);
+        frame.stroke(&path, canvas::Stroke::default().with_color(pal.card_line).with_width(1.0));
         vec![frame.into_geometry()]
     }
 }

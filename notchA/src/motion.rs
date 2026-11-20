@@ -187,6 +187,9 @@ pub struct Anim {
     pub release: Tween,
     pub grip: Spring,
     pub press: Spring,
+    pub card_pos: Spring,
+    pub tail_pos: Spring,
+    pub card_h: Spring,
     pub fold_t: f32,
     pub card_t: f32,
     pub orb_t: f32,
@@ -195,6 +198,9 @@ pub struct Anim {
     pub release_t: f32,
     pub grip_out: f32,
     pub press_t: f32,
+    pub card_pos_t: f32,
+    pub tail_pos_t: f32,
+    pub card_h_t: f32,
 }
 
 impl Default for Anim {
@@ -208,6 +214,9 @@ impl Default for Anim {
             release: Tween::new(0.0, 0, RELEASE),
             grip: Spring::new(24.0, 0.76),
             press: Spring::new(34.0, 0.9),
+            card_pos: Spring::new(20.0, 0.85),
+            tail_pos: Spring::new(28.0, 0.78),
+            card_h: Spring::new(24.0, 0.85),
             fold_t: 0.0,
             card_t: 0.0,
             orb_t: 0.0,
@@ -216,6 +225,9 @@ impl Default for Anim {
             release_t: 0.0,
             grip_out: 0.0,
             press_t: 0.0,
+            card_pos_t: 0.0,
+            tail_pos_t: 0.0,
+            card_h_t: 160.0,
         }
     }
 }
@@ -232,6 +244,21 @@ impl Anim {
         self.card.retarget(open as u8 as f32, CARD_MS, CARD, now);
         if !enabled {
             self.card.jump(open as u8 as f32);
+        }
+    }
+
+    pub fn retarget_card_pos(&mut self, pos: f32, height: f32, instant: bool) {
+        if instant || self.card_t < 0.01 {
+            self.card_pos.jump(pos);
+            self.tail_pos.jump(pos);
+            self.card_h.jump(height);
+            self.card_pos_t = pos;
+            self.tail_pos_t = pos;
+            self.card_h_t = height;
+        } else {
+            self.card_pos.retarget(pos);
+            self.tail_pos.retarget(pos);
+            self.card_h.retarget(height);
         }
     }
 
@@ -282,6 +309,9 @@ impl Anim {
         self.release_t = unit(self.release.value(now));
         self.grip_out = unit(self.grip.step(dt));
         self.press_t = unit(self.press.step(dt));
+        self.card_pos_t = self.card_pos.step(dt);
+        self.tail_pos_t = self.tail_pos.step(dt);
+        self.card_h_t = self.card_h.step(dt);
         // The release arc is a one-shot pulse; clear it once it has played.
         if self.release.to > 0.0 && self.release.done(now) {
             self.release.jump(0.0);
@@ -298,6 +328,9 @@ impl Anim {
             || !self.release.done(now)
             || !self.grip.settled()
             || !self.press.settled()
+            || !self.card_pos.settled()
+            || !self.tail_pos.settled()
+            || !self.card_h.settled()
     }
 }
 
