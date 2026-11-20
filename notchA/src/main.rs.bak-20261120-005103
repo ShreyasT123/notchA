@@ -1,0 +1,991 @@
+#![allow(dead_code, unused)]
+
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
+mod activity;
+mod agy_cli;
+mod antigravity;
+mod backdrop;
+mod carry;
+mod claude_accounts;
+mod claude_auth;
+mod codex;
+mod config;
+mod copilot;
+mod core;
+mod diag;
+mod doctor;
+mod focus;
+mod fullscreen;
+mod glyphs;
+mod hooks_install;
+mod i18n;
+mod notch_view;
+mod notchmenu;
+mod opencode;
+mod reset_alert;
+mod reset_view;
+mod reset_watch;
+mod server;
+mod settings_view;
+mod settings_window;
+mod state;
+mod taskbar;
+mod taskbar_activity;
+mod taskbar_model;
+#[cfg(windows)]
+mod taskbar_native;
+#[cfg(windows)]
+mod taskbar_render;
+mod theme;
+mod topmost;
+mod tray;
+mod trayicon;
+mod traymenu;
+mod usage;
+mod watcher;
+
+pub use crate::core::{
+    applog, apply_visibility, broadcast, glide_notch, keeps_open, lane_family, lane_is, now_ms,
+    open_provider_page, place_notch, provider_label, provider_page, refresh_all,
+    refresh_provider, reload_glyphs, resolved_theme, ring_fraction, ring_window, screens,
+    snapshot_of, target_screen, tightest, toggle_keep_open, ui_scale, AppState, Screen,
+    DRAGGING, NOTCH_LONG, NOTCH_W, TRAY_PROVIDER_IDS,
+};
+
+use crate::core::{AppHandle, Manager, UiEvent};
+use iced::window;
+use iced::{Color, Element, Length, Point, Size, Subscription, Task};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+enum Msg {
+    Ui(UiEvent),
+    NotchWindowOpened(window::Id),
+    SettingsWindowOpened(window::Id),
+    ResetWindowOpened(window::Id),
+    TaskbarHoverOpened(window::Id),
+    WindowClosed(window::Id),
+    GotHwnd(String, window::Id, isize),
+    Tick(Instant),
+    WatchdogPoll,
+    Notch(notch_view::NotchMsg),
+    Settings(settings_view::SettingsMsg),
+    Reset(reset_view::ResetMsg),
+}
+
+struct NotchA {
+    app: AppHandle,
+    active_reset: Option<reset_alert::CardPayload>,
+    notch_id: Option<window::Id>,
+    settings_id: Option<window::Id>,
+    reset_id: Option<window::Id>,
+    tb_hover_id: Option<window::Id>,
+
+    notch_ui: notch_view::NotchUiState,
+    cells: Vec<notch_view::NotchCell>,
+    last_cursor: Point,
+    passthrough: bool,
+    started_at: Instant,
+    collapse_at: Option<Instant>,
+    fold_at: Option<Instant>,
+
+    settings_tab: settings_view::SettingsTab,
+    settings_err: Option<String>,
+    settings_toast: Option<String>,
+    system_look: settings_window::SystemLook,
+}
+
+impl NotchA {
+    fn boot() -> (Self, Task<Msg>) {
+        let cfg = config::load();
+        let port = cfg.port;
+        let (app, rx) = core::init_core(cfg.clone());
+        let _ = UI_RX.set(std::sync::Mutex::new(Some(rx)));
+
+        let edge = config::edge_or_right(&cfg.notch_edge);
+        let scale = config::snap_scale(cfg.scale) as f32;
+        let dark = core::resolved_theme(&app) != "light";
+        let (lw, lh) = core::notch_window_size(&edge);
+
+        // Start tray & background engines
+        let _ = tray::setup(&app);
+        start_background_services(&app, port);
+
+        let cells = notch_view::build_cells(&app);
+        let notch_ui = notch_view::NotchUiState {
+            edge: edge.clone(),
+            scale,
+            dark,
+            folded: cfg.notch_on_hover,
+            ..Default::default()
+        };
+
+        let init_pos = if let Some(mon) = core::target_screen(&app) {
+            let ww = (lw * mon.scale * scale as f64).round() as i32;
+            let wh = (lh * mon.scale * scale as f64).round() as i32;
+            let (px, py) = core::edge_origin(&mon, &edge, ww, wh, cfg.along(&edge));
+            window::Position::Specific(Point::new(px as f32 / mon.scale as f32, py as f32 / mon.scale as f32))
+        } else {
+            window::Position::Default
+        };
+
+        let mut open_task = Task::none();
+        if cfg.notch_visible {
+            let (id, task) = window::open(window::Settings {
+                size: Size::new(lw as f32 * scale, lh as f32 * scale),
+                position: init_pos,
+                decorations: false,
+                transparent: true,
+                resizable: false,
+                level: window::Level::AlwaysOnTop,
+                exit_on_close_request: false,
+                ..Default::default()
+            });
+            open_task = task.map(Msg::NotchWindowOpened);
+            let _ = id;
+        }
+
+        let app_state = Self {
+            app,
+            active_reset: None,
+            notch_id: None,
+            settings_id: None,
+            reset_id: None,
+            tb_hover_id: None,
+            notch_ui,
+            cells,
+            last_cursor: Point::ORIGIN,
+            passthrough: true,
+            started_at: Instant::now(),
+            collapse_at: None,
+            fold_at: None,
+            settings_tab: settings_view::SettingsTab::Accounts,
+            settings_err: None,
+            settings_toast: None,
+            system_look: settings_window::get_system_look(),
+        };
+        (app_state, open_task)
+    }
+
+    fn update(&mut self, msg: Msg) -> Task<Msg> {
+        match msg {
+            Msg::NotchWindowOpened(id) => {
+                self.notch_id = Some(id);
+                let mut tasks = vec![
+                    window::enable_mouse_passthrough(id),
+                    fetch_hwnd_task("notch", id),
+                ];
+                tasks.push(self.place_notch_task());
+                Task::batch(tasks)
+            }
+            Msg::SettingsWindowOpened(id) => {
+                self.settings_id = Some(id);
+                fetch_hwnd_task("settings", id)
+            }
+            Msg::ResetWindowOpened(id) => {
+                self.reset_id = Some(id);
+                fetch_hwnd_task("reset-alert", id)
+            }
+            Msg::TaskbarHoverOpened(id) => {
+                self.tb_hover_id = Some(id);
+                fetch_hwnd_task("taskbar-hover", id)
+            }
+            Msg::WindowClosed(id) => {
+                if self.settings_id == Some(id) {
+                    self.settings_id = None;
+                    self.app.unregister_hwnd("settings");
+                } else if self.reset_id == Some(id) {
+                    self.reset_id = None;
+                    self.app.unregister_hwnd("reset-alert");
+                } else if self.tb_hover_id == Some(id) {
+                    self.tb_hover_id = None;
+                    self.app.unregister_hwnd("taskbar-hover");
+                }
+                Task::none()
+            }
+            Msg::GotHwnd(label, id, hwnd) => {
+                self.app.register_hwnd(&label, hwnd);
+                if label == "notch" || label == "reset-alert" || label == "taskbar-hover" {
+                    apply_noactivate_toolwindow(hwnd);
+                    if label == "notch" {
+                        return self.place_notch_task();
+                    }
+                } else if label == "settings" {
+                    settings_window::apply_mica(hwnd, self.notch_ui.dark);
+                    return window::gain_focus(id);
+                }
+                Task::none()
+            }
+            Msg::Ui(ev) => self.handle_ui_event(ev),
+            Msg::Tick(now) => {
+                self.notch_ui.anim_secs = self.started_at.elapsed().as_secs_f32();
+                self.notch_ui.refreshing_ids.retain(|_, until| *until > now);
+                let target_grip = if self.notch_ui.orb_hovered || self.notch_ui.grip_hovered { 1.0 } else { 0.0 };
+                let diff = target_grip - self.notch_ui.grip_out;
+                if diff.abs() > 0.01 {
+                    self.notch_ui.grip_out += diff * 0.25;
+                } else {
+                    self.notch_ui.grip_out = target_grip;
+                }
+                if let Some(t) = self.collapse_at {
+                    if now >= t {
+                        self.collapse_at = None;
+                        self.notch_ui.card_open = false;
+                        core::EXPANDED.store(false, Ordering::Relaxed);
+                    }
+                }
+                if let Some(t) = self.fold_at {
+                    if now >= t {
+                        self.fold_at = None;
+                        let on_hover = self.app.state::<AppState>().cfg.lock().unwrap().notch_on_hover;
+                        if (on_hover || self.notch_ui.full_screen) && !self.notch_ui.pointer_in && !self.notch_ui.menu_open && !DRAGGING.load(Ordering::SeqCst) {
+                            self.notch_ui.folded = true;
+                            self.notch_ui.card_open = false;
+                            core::EXPANDED.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+                self.update_backdrop_probe();
+                Task::none()
+            }
+            Msg::WatchdogPoll => self.poll_pointer_watchdog(),
+            Msg::Notch(nmsg) => self.handle_notch_msg(nmsg),
+            Msg::Settings(smsg) => {
+                match &smsg {
+                    settings_view::SettingsMsg::Close => {
+                        if let Some(id) = self.settings_id.take() {
+                            self.app.unregister_hwnd("settings");
+                            return window::close(id);
+                        }
+                    }
+                    settings_view::SettingsMsg::Quit => return iced::exit(),
+                    _ => {}
+                }
+                let (tab, err, toast) = settings_view::handle_msg(&self.app, smsg);
+                if let Some(t) = tab { self.settings_tab = t; }
+                self.settings_err = err;
+                self.settings_toast = toast;
+                self.cells = notch_view::build_cells(&self.app);
+                Task::none()
+            }
+            Msg::Reset(rmsg) => match rmsg {
+                reset_view::ResetMsg::Dismiss(token) => {
+                    reset_alert::dismiss_reset_alert(&self.app, token);
+                    if let Some(id) = self.reset_id.take() {
+                        self.app.unregister_hwnd("reset-alert");
+                        return window::close(id);
+                    }
+                    Task::none()
+                }
+            },
+        }
+    }
+
+    fn handle_ui_event(&mut self, ev: UiEvent) -> Task<Msg> {
+        match ev {
+            UiEvent::MainThread(f) => {
+                f();
+                Task::none()
+            }
+            UiEvent::MenuAction(id) => {
+                tray::handle_menu_id(&self.app, &id);
+                Task::none()
+            }
+            UiEvent::BackendEvent { name, payload, .. } => {
+                match name.as_str() {
+                    "usage" | "codex" | "copilot" | "antigravity" | "opencode" | "glyphs" | "claude_accounts_changed" => {
+                        self.cells = notch_view::build_cells(&self.app);
+                        let key = match name.as_str() {
+                            "usage" => "claude",
+                            "antigravity" => "gemini",
+                            other => other,
+                        };
+                        self.notch_ui.refreshing_ids.retain(|k, _| !k.starts_with(key));
+                    }
+                    "full_screen" => {
+                        let fs = payload.as_bool().unwrap_or(false);
+                        self.notch_ui.full_screen = fs;
+                        if fs && !self.notch_ui.pointer_in {
+                            self.notch_ui.folded = true;
+                            self.notch_ui.card_open = false;
+                        } else if !fs {
+                            let on_hover = self.app.state::<AppState>().cfg.lock().unwrap().notch_on_hover;
+                            if !on_hover {
+                                self.notch_ui.folded = false;
+                            }
+                        }
+                    }
+                    "pill_backdrop" => {
+                        self.notch_ui.behind = match payload.as_str() {
+                            Some("dark") => Some("dark".into()),
+                            Some("light") => Some("light".into()),
+                            _ => None,
+                        };
+                    }
+                    _ => {}
+                }
+                Task::none()
+            }
+            UiEvent::PlaceNotch | UiEvent::GlideNotch => self.place_notch_task(),
+            UiEvent::ApplyTheme => {
+                self.notch_ui.dark = core::resolved_theme(&self.app) != "light";
+                if let Some(w) = self.app.get_webview_window("settings") {
+                    settings_window::apply_mica(w.hwnd, self.notch_ui.dark);
+                }
+                Task::none()
+            }
+            UiEvent::ApplyVisibility => {
+                let (notch_vis, on_hover, tray_vis) = {
+                    let c = self.app.state::<AppState>().cfg.lock().unwrap();
+                    (c.notch_visible, c.notch_on_hover, c.tray_visible)
+                };
+                tray::set_visible(tray_vis);
+                if !on_hover && !self.notch_ui.full_screen {
+                    self.notch_ui.folded = false;
+                } else if on_hover && !self.notch_ui.pointer_in {
+                    self.notch_ui.folded = true;
+                }
+                if notch_vis {
+                    if self.notch_id.is_some() {
+                        return self.place_notch_task();
+                    }
+                    let (lw, lh) = self.notch_ui.window_logical_size();
+                    let (_id, task) = window::open(window::Settings {
+                        size: Size::new(lw, lh),
+                        decorations: false,
+                        transparent: true,
+                        resizable: false,
+                        level: window::Level::AlwaysOnTop,
+                        exit_on_close_request: false,
+                        ..Default::default()
+                    });
+                    return task.map(Msg::NotchWindowOpened);
+                } else if let Some(id) = self.notch_id.take() {
+                    self.app.unregister_hwnd("notch");
+                    return window::close(id);
+                }
+                Task::none()
+            }
+            UiEvent::OpenSettings => {
+                self.system_look = settings_window::get_system_look();
+                if let Some(id) = self.settings_id {
+                    return window::gain_focus(id);
+                }
+                let (_id, task) = window::open(window::Settings {
+                    size: Size::new(680.0, 520.0),
+                    position: window::Position::Centered,
+                    decorations: false,
+                    transparent: true,
+                    resizable: false,
+                    ..Default::default()
+                });
+                task.map(Msg::SettingsWindowOpened)
+            }
+            UiEvent::ShowResetAlert => {
+                let Some(payload) = reset_alert::active_card(&self.app) else { return Task::none(); };
+                self.active_reset = Some(payload.clone());
+                let close_old = self.reset_id.take().map(|id| { self.app.unregister_hwnd("reset-alert"); window::close(id) }).unwrap_or_else(Task::none);
+                let scale = core::target_screen(&self.app).map(|s| s.scale).unwrap_or(1.0);
+                let (_id, task) = window::open(window::Settings {
+                    size: Size::new(payload.size.0 as f32 / scale as f32, payload.size.1 as f32 / scale as f32),
+                    position: window::Position::Specific(Point::new(
+                        payload.pos.0 as f32 / scale as f32,
+                        payload.pos.1 as f32 / scale as f32,
+                    )),
+                    decorations: false,
+                    transparent: true,
+                    resizable: false,
+                    level: window::Level::AlwaysOnTop,
+                    exit_on_close_request: false,
+                    ..Default::default()
+                });
+                Task::batch([close_old, task.map(Msg::ResetWindowOpened)])
+            }
+            UiEvent::HideResetAlert => {
+                self.active_reset = None;
+                if let Some(id) = self.reset_id.take() {
+                    self.app.unregister_hwnd("reset-alert");
+                    return window::close(id);
+                }
+                Task::none()
+            }
+            UiEvent::ShowTaskbarHover { .. } => {
+                let Some((_item_id, bounds, _below, _tx)) = taskbar::current_hover_info() else {
+                    return Task::none();
+                };
+                let scale = core::target_screen(&self.app).map(|s| s.scale).unwrap_or(1.0);
+                let pos = Point::new(bounds.left as f32 / scale as f32, bounds.top as f32 / scale as f32);
+                let size = Size::new(
+                    (bounds.right - bounds.left) as f32 / scale as f32,
+                    (bounds.bottom - bounds.top) as f32 / scale as f32,
+                );
+                if let Some(id) = self.tb_hover_id {
+                    return Task::batch([window::move_to(id, pos), window::resize(id, size)]);
+                }
+                let (_id, task) = window::open(window::Settings {
+                    size,
+                    position: window::Position::Specific(pos),
+                    decorations: false,
+                    transparent: true,
+                    resizable: false,
+                    level: window::Level::AlwaysOnTop,
+                    exit_on_close_request: false,
+                    ..Default::default()
+                });
+                task.map(Msg::TaskbarHoverOpened)
+            }
+            UiEvent::HideTaskbarHover => {
+                if let Some(id) = self.tb_hover_id.take() {
+                    self.app.unregister_hwnd("taskbar-hover");
+                    return window::close(id);
+                }
+                Task::none()
+            }
+            UiEvent::OpenTaskbarDetails => {
+                self.app.send_ui(UiEvent::OpenSettings);
+                Task::none()
+            }
+            UiEvent::Quit => iced::exit(),
+        }
+    }
+
+    fn handle_notch_msg(&mut self, msg: notch_view::NotchMsg) -> Task<Msg> {
+        match msg {
+            notch_view::NotchMsg::PointerEntered => {
+                self.notch_ui.pointer_in = true;
+                self.fold_at = None;
+                self.collapse_at = None;
+                self.notch_ui.folded = false;
+            }
+            notch_view::NotchMsg::PointerExited => {
+                self.notch_ui.pointer_in = false;
+                self.notch_ui.orb_hovered = false;
+                self.notch_ui.grip_hovered = false;
+                self.collapse_at = Some(Instant::now() + Duration::from_millis(250));
+                self.fold_at = Some(Instant::now() + Duration::from_millis(450));
+            }
+            notch_view::NotchMsg::PointerMoved(pt) => {
+                self.last_cursor = pt;
+                let s = self.notch_ui.scale;
+                let p = Point::new(pt.x / s, pt.y / s);
+                let layout = notch_view::compute_layout(&self.notch_ui, &self.cells);
+
+                let orb_dist = ((p.x - layout.orb_center.x).powi(2) + (p.y - layout.orb_center.y).powi(2)).sqrt();
+                let grip_dist = ((p.x - layout.grip_center.x).powi(2) + (p.y - layout.grip_center.y).powi(2)).sqrt();
+                self.notch_ui.orb_hovered = orb_dist <= 28.5;
+                self.notch_ui.grip_hovered = (self.notch_ui.orb_hovered || self.notch_ui.grip_hovered) && grip_dist <= 26.3 && !self.notch_ui.orb_hovered;
+
+                if self.notch_ui.orb_hovered || self.notch_ui.grip_hovered {
+                    self.notch_ui.card_open = false;
+                    core::EXPANDED.store(false, Ordering::Relaxed);
+                } else if layout.pill_rect.contains(p) {
+                    self.collapse_at = None;
+                    let mut best: Option<(String, f32)> = None;
+                    for (i, cell) in self.cells.iter().enumerate() {
+                        let c = layout.cell_centers[i];
+                        let d = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt();
+                        if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                            best = Some((cell.id.clone(), d));
+                        }
+                    }
+                    if let Some((cid, _)) = best {
+                        self.notch_ui.hover_id = Some(cid);
+                    }
+                    self.notch_ui.card_open = true;
+                    core::EXPANDED.store(true, Ordering::Relaxed);
+                } else if layout.card_rect.is_some_and(|r| r.contains(p)) || layout.tail_rect.is_some_and(|r| r.contains(p)) {
+                    self.collapse_at = None;
+                } else if self.notch_ui.card_open && self.collapse_at.is_none() {
+                    self.collapse_at = Some(Instant::now() + Duration::from_millis(250));
+                }
+            }
+            notch_view::NotchMsg::LeftPress => {
+                let s = self.notch_ui.scale;
+                let p = Point::new(self.last_cursor.x / s, self.last_cursor.y / s);
+                let layout = notch_view::compute_layout(&self.notch_ui, &self.cells);
+                let orb_dist = ((p.x - layout.orb_center.x).powi(2) + (p.y - layout.orb_center.y).powi(2)).sqrt();
+                let grip_dist = ((p.x - layout.grip_center.x).powi(2) + (p.y - layout.grip_center.y).powi(2)).sqrt();
+
+                if grip_dist <= 26.3 && (self.notch_ui.grip_hovered || self.notch_ui.orb_hovered) {
+                    self.notch_ui.card_open = false;
+                    carry::begin_carry(self.app.clone());
+                } else if orb_dist <= 28.5 {
+                    self.app.send_ui(UiEvent::OpenSettings);
+                } else if alt_down() && layout.pill_rect.contains(p) {
+                    self.notch_ui.card_open = false;
+                    carry::begin_carry(self.app.clone());
+                } else if let Some(cid) = self.cell_at(p, &layout) {
+                    self.notch_ui.pressing = Some((p, cid));
+                }
+            }
+            notch_view::NotchMsg::LeftRelease => {
+                if let Some((_start, cid)) = self.notch_ui.pressing.take() {
+                    let base = self
+                        .cells
+                        .iter()
+                        .find(|c| c.id == cid)
+                        .map(|c| c.base.as_str())
+                        .unwrap_or("claude");
+                    if core::refresh_provider(base) {
+                        self.notch_ui
+                            .refreshing_ids
+                            .insert(cid, Instant::now() + Duration::from_millis(1200));
+                    }
+                }
+            }
+            notch_view::NotchMsg::RightPress => {
+                let s = self.notch_ui.scale;
+                let p = Point::new(self.last_cursor.x / s, self.last_cursor.y / s);
+                let layout = notch_view::compute_layout(&self.notch_ui, &self.cells);
+                let provider = self
+                    .cell_at(p, &layout)
+                    .and_then(|cid| self.cells.iter().find(|c| c.id == cid).map(|c| c.base.clone()))
+                    .or_else(|| self.notch_ui.hover_id.clone());
+                if let Some(w) = self.app.get_webview_window("notch") {
+                    self.notch_ui.menu_open = true;
+                    notchmenu::show_notch_menu(&self.app, w.hwnd, provider.as_deref());
+                    self.notch_ui.menu_open = false;
+                }
+            }
+            notch_view::NotchMsg::ClaudeSignIn => {
+                let _ = claude_auth::start_login();
+            }
+        }
+        Task::none()
+    }
+
+    fn cell_at(&self, p: Point, layout: &notch_view::NotchLayout) -> Option<String> {
+        let mut best = None;
+        for (i, cell) in self.cells.iter().enumerate() {
+            let c = layout.cell_centers[i];
+            let d = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt();
+            if d < 36.0 && best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                best = Some((cell.id.clone(), d));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    fn poll_pointer_watchdog(&mut self) -> Task<Msg> {
+        let Some(id) = self.notch_id else {
+            return Task::none();
+        };
+        let Some(w) = self.app.get_webview_window("notch") else {
+            return Task::none();
+        };
+        let (Ok(pos), Ok(cur)) = (w.outer_position(), self.app.cursor_position()) else {
+            return Task::none();
+        };
+        let mon_scale = core::target_screen(&self.app).map(|s| s.scale).unwrap_or(1.0);
+        let rects = notch_view::hot_rects_physical(&self.notch_ui, &self.cells, mon_scale);
+        let lx = cur.x - pos.x;
+        let ly = cur.y - pos.y;
+        let inside = rects.iter().any(|r| {
+            lx >= r[0] - 10.0 && ly >= r[1] - 10.0 && lx < r[0] + r[2] + 10.0 && ly < r[1] + r[3] + 10.0
+        });
+
+        let want_passthrough = !inside;
+        if want_passthrough != self.passthrough {
+            self.passthrough = want_passthrough;
+            if inside {
+                self.notch_ui.pointer_in = true;
+                self.fold_at = None;
+                self.notch_ui.folded = false;
+                return window::disable_mouse_passthrough(id);
+            } else {
+                self.notch_ui.pointer_in = false;
+                self.notch_ui.orb_hovered = false;
+                self.notch_ui.grip_hovered = false;
+                self.collapse_at = Some(Instant::now() + Duration::from_millis(250));
+                self.fold_at = Some(Instant::now() + Duration::from_millis(450));
+                return window::enable_mouse_passthrough(id);
+            }
+        }
+        Task::none()
+    }
+
+    fn update_backdrop_probe(&self) {
+        if self.notch_ui.folded {
+            let mon_scale = core::target_screen(&self.app).map(|s| s.scale).unwrap_or(1.0);
+            backdrop::set_probe(Some(notch_view::probe_rect_physical(
+                &self.notch_ui,
+                &self.cells,
+                mon_scale,
+            )));
+        } else {
+            backdrop::set_probe(None);
+        }
+    }
+
+    fn place_notch_task(&mut self) -> Task<Msg> {
+        let (edge, ratio, scale) = {
+            let c = self.app.state::<AppState>().cfg.lock().unwrap();
+            let edge = config::edge_or_right(&c.notch_edge);
+            (edge.clone(), c.along(&edge), config::snap_scale(c.scale) as f32)
+        };
+        self.notch_ui.edge = edge.clone();
+        self.notch_ui.scale = scale;
+
+        let Some(id) = self.notch_id else { return Task::none() };
+        let Some(mon) = core::target_screen(&self.app) else { return Task::none() };
+        let (lw, lh) = core::notch_window_size(&edge);
+        let ww = ((lw * mon.scale * scale as f64).round() as i32).min(mon.w.max(1));
+        let wh = ((lh * mon.scale * scale as f64).round() as i32).min(mon.h.max(1));
+        let (px, py) = core::edge_origin(&mon, &edge, ww, wh, ratio);
+        let insets = core::work_insets(&mon, px, py, ww, wh);
+        let css = (mon.scale * scale as f64).max(0.01) as f32;
+        self.notch_ui.insets = insets.map(|v| v as f32 / css);
+
+        let pos = Point::new(px as f32 / mon.scale as f32, py as f32 / mon.scale as f32);
+        let size = Size::new(ww as f32 / mon.scale as f32, wh as f32 / mon.scale as f32);
+        Task::batch([window::resize(id, size), window::move_to(id, pos)])
+    }
+
+    fn view(&self, id: window::Id) -> Element<'_, Msg> {
+        if Some(id) == self.notch_id {
+            return notch_view::view(&self.app, &self.notch_ui, &self.cells).map(Msg::Notch);
+        }
+        if Some(id) == self.settings_id {
+            return settings_view::view(
+                &self.app,
+                self.settings_tab,
+                self.notch_ui.dark,
+                self.settings_err.as_deref(),
+                self.settings_toast.as_deref(),
+                &self.system_look,
+            )
+            .map(Msg::Settings);
+        }
+        if Some(id) == self.reset_id {
+            if let Some(payload) = &self.active_reset { return reset_view::view(payload, self.notch_ui.dark).map(Msg::Reset); }
+        }
+        if Some(id) == self.tb_hover_id {
+            if let Some((item_id, _, _, _)) = taskbar::current_hover_info() {
+                let card_id = if item_id == "claude@default" { "claude" } else { item_id.as_str() };
+                if let Some(cell) = self.cells.iter().find(|c| c.id == card_id).or(self.cells.first()) {
+                    let st = self.app.state::<AppState>();
+                    let cfg = st.cfg.lock().unwrap().clone();
+                    let glyphs_map = st.glyphs.lock().unwrap().clone();
+                    let store_snap = st.store.lock().unwrap().snapshot("en", "en", i18n::clock_24h(), false);
+                    let acts = st.activity.lock().unwrap().clone();
+                    let pal = theme::palette(self.notch_ui.dark);
+                    return notch_view::render_card(
+                        cell,
+                        glyphs_map.get(&cell.base),
+                        &cfg,
+                        &store_snap,
+                        &acts,
+                        pal,
+                        self.notch_ui.scale,
+                        now_ms(),
+                    )
+                    .map(Msg::Notch);
+                }
+            }
+        }
+        iced::widget::space::horizontal().width(Length::Shrink).into()
+    }
+
+    fn title(&self, id: window::Id) -> String {
+        if Some(id) == self.settings_id {
+            "notchA Settings".into()
+        } else {
+            "notchA".into()
+        }
+    }
+
+    fn theme(&self, _id: window::Id) -> iced::Theme {
+        if self.notch_ui.dark {
+            iced::Theme::Dark
+        } else {
+            iced::Theme::Light
+        }
+    }
+
+    fn style(&self, _theme: &iced::Theme) -> iced::theme::Style {
+        iced::theme::Style {
+            background_color: Color::TRANSPARENT,
+            text_color: if self.notch_ui.dark { Color::WHITE } else { Color::BLACK },
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Msg> {
+        let mut subs = vec![
+            window::close_events().map(Msg::WindowClosed),
+            iced::time::every(Duration::from_millis(50)).map(|_| Msg::WatchdogPoll),
+            ui_event_subscription(&self.app),
+        ];
+
+        let store_snap = self.app.state::<AppState>().store.lock().unwrap().snapshot("en", "en", false, false);
+        let acts = self.app.state::<AppState>().activity.lock().unwrap().clone();
+        let any_active = !self.notch_ui.folded
+            && self.cells.iter().any(|c| notch_view::work_state_of(&c.base, &store_snap, &acts) != "idle");
+        let animating = any_active
+            || !self.notch_ui.refreshing_ids.is_empty()
+            || self.collapse_at.is_some()
+            || self.fold_at.is_some()
+            || (self.notch_ui.grip_out > 0.01 && self.notch_ui.grip_out < 0.99);
+
+        if animating {
+            subs.push(iced::time::every(Duration::from_millis(33)).map(Msg::Tick));
+        }
+
+        Subscription::batch(subs)
+    }
+}
+
+static UI_RX: std::sync::OnceLock<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<UiEvent>>>> = std::sync::OnceLock::new();
+
+fn ui_event_subscription(_app: &AppHandle) -> Subscription<Msg> {
+    Subscription::run(|| {
+        iced::stream::channel(256, |mut output: iced::futures::channel::mpsc::Sender<Msg>| async move {
+            use iced::futures::SinkExt;
+            let mut rx = UI_RX.get().and_then(|m| m.lock().unwrap().take());
+            if let Some(ref mut receiver) = rx {
+                while let Some(ev) = receiver.recv().await {
+                    let _ = output.send(Msg::Ui(ev)).await;
+                }
+            }
+            std::future::pending::<()>().await;
+        })
+    })
+}
+
+fn fetch_hwnd_task(label: &'static str, id: window::Id) -> Task<Msg> {
+    window::run(id, move |w| {
+        use raw_window_handle::RawWindowHandle;
+        let hwnd = w
+            .window_handle()
+            .ok()
+            .and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(win) => Some(win.hwnd.get()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Msg::GotHwnd(label.into(), id, hwnd)
+    })
+}
+
+#[cfg(windows)]
+fn apply_noactivate_toolwindow(hwnd_raw: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    };
+    if hwnd_raw == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd_raw as _);
+    unsafe {
+        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let next = cur | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_noactivate_toolwindow(_hwnd_raw: isize) {}
+
+#[cfg(windows)]
+fn alt_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+    unsafe { (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(windows))]
+fn alt_down() -> bool { false }
+
+fn start_background_services(app: &AppHandle, port: u16) {
+    server::start(app.clone(), port);
+    watcher::start(app.clone());
+    usage::start(app.clone());
+    codex::start(app.clone());
+    copilot::start(app.clone());
+    antigravity::start(app.clone());
+    opencode::start(app.clone());
+    activity::start(app.clone());
+    reset_watch::start(app.clone());
+
+    let gh = app.clone();
+    std::thread::spawn(move || reload_glyphs(&gh));
+
+    backdrop::start(app.clone());
+    fullscreen::start(app.clone());
+    topmost::start_watchdog(app.clone());
+    taskbar::start(app);
+
+    // Tray menu updater
+    let menu_app = app.clone();
+    std::thread::spawn(move || {
+        let mut last: Option<Vec<Option<i64>>> = None;
+        let mut ticked = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let values: Vec<Option<i64>> = TRAY_PROVIDER_IDS
+                .iter()
+                .map(|id| ring_fraction(&menu_app, id).map(|f| (f * 1000.0).round() as i64))
+                .collect();
+            let changed = last.as_ref() != Some(&values);
+            if !changed && ticked.elapsed() < Duration::from_secs(60) {
+                continue;
+            }
+            if changed {
+                last = Some(values);
+            }
+            ticked = Instant::now();
+            tray::refresh_menu(&menu_app);
+        }
+    });
+
+    // Work-area & system theme watcher
+    let wa_app = app.clone();
+    std::thread::spawn(move || {
+        let mut last = core::attached_screen(&wa_app).map(|s| s.work);
+        let mut last_theme = resolved_theme(&wa_app);
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            if DRAGGING.load(Ordering::SeqCst) {
+                continue;
+            }
+            let sys_theme = resolved_theme(&wa_app);
+            if sys_theme != last_theme {
+                last_theme = sys_theme;
+                wa_app.send_ui(UiEvent::ApplyTheme);
+            }
+            let now = core::attached_screen(&wa_app).map(|s| s.work);
+            if now != last {
+                last = now;
+                place_notch(&wa_app);
+            }
+        }
+    });
+
+    // Seen-clears-it scan
+    let acker = app.clone();
+    std::thread::spawn(move || {
+        activity::lower_thread_priority();
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+            if ack_scan(&acker) {
+                broadcast(&acker);
+            }
+        }
+    });
+
+    // Stale session cleanup
+    let sweeper = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        let changed = sweeper.state::<AppState>().store.lock().unwrap().sweep();
+        if changed {
+            broadcast(&sweeper);
+        }
+    });
+}
+
+#[cfg(windows)]
+fn ack_scan(app: &AppHandle) -> bool {
+    let need = app.state::<AppState>().store.lock().unwrap().has_done();
+    if !need { return false; }
+    let fg = focus::fg_pid();
+    if fg == 0 { return false; }
+    let maps = focus::proc_maps();
+    let fg_name = maps.name.get(&fg).cloned().unwrap_or_default();
+    let fg_is_claude_desktop = fg_name.contains("claude") && !fg_name.contains("notcha");
+    app.state::<AppState>().store.lock().unwrap().ack_done(|s| {
+        if s.ppid == 0 {
+            fg_is_claude_desktop
+        } else {
+            focus::pid_hits_chain(fg, &focus::chain_of(s.ppid, &maps.ppid), &maps)
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn ack_scan(_app: &AppHandle) -> bool { false }
+
+#[cfg(windows)]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
+}
+
+fn report(r: Result<String, String>) {
+    let msg = match r {
+        Ok(m) => format!("OK: {m}"),
+        Err(e) => format!("FAILED: {e}"),
+    };
+    println!("{msg}");
+    let log = config::config_path().with_file_name("install.log");
+    let _ = std::fs::write(log, &msg);
+}
+
+#[cfg(windows)]
+fn adopt_system_proxy() {
+    if ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+    {
+        return;
+    }
+    let query = |v: &str| -> Option<String> {
+        let mut c = std::process::Command::new("reg");
+        c.args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings", "/v", v]);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+        let out = c.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find(|l| l.trim_start().starts_with(v))
+            .and_then(|l| l.split_whitespace().last().map(str::to_string))
+    };
+    if query("ProxyEnable").as_deref() != Some("0x1") {
+        return;
+    }
+    let Some(server) = query("ProxyServer") else { return };
+    let https = server
+        .split(';')
+        .find_map(|e| e.strip_prefix("https="))
+        .or_else(|| if server.contains('=') { server.split(';').find_map(|e| e.strip_prefix("http=")) } else { Some(server.as_str()) });
+    if let Some(h) = https {
+        let url = if h.contains("://") { h.to_string() } else { format!("http://{h}") };
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", &url);
+            std::env::set_var("HTTP_PROXY", &url);
+        }
+    }
+}
+
+fn main() {
+    #[cfg(windows)]
+    adopt_system_proxy();
+
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(cmd) = args.get(1) {
+        if ["install-hooks", "uninstall-hooks", "doctor"].contains(&cmd.as_str()) {
+            #[cfg(windows)]
+            attach_console();
+        }
+        match cmd.as_str() {
+            "install-hooks" => { report(hooks_install::install()); return; }
+            "uninstall-hooks" => { report(hooks_install::uninstall()); return; }
+            "doctor" => {
+                let out = if args.get(2).map(|s| s.as_str()) == Some("deep") { diag::run() } else { doctor::run() };
+                println!("{out}");
+                let _ = std::fs::write(config::config_path().with_file_name("doctor.log"), &out);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    iced::daemon(NotchA::boot, NotchA::update, NotchA::view)
+        .title(NotchA::title)
+        .theme(NotchA::theme)
+        .style(NotchA::style)
+        .subscription(NotchA::subscription)
+        .run()
+        .expect("notchA failed to start");
+}

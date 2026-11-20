@@ -578,8 +578,14 @@ impl NotchA {
 
                 let orb_dist = ((p.x - layout.orb_center.x).powi(2) + (p.y - layout.orb_center.y).powi(2)).sqrt();
                 let grip_dist = ((p.x - layout.grip_center.x).powi(2) + (p.y - layout.grip_center.y).powi(2)).sqrt();
-                self.notch_ui.orb_hovered = orb_dist <= 28.5;
-                self.notch_ui.grip_hovered = (self.notch_ui.orb_hovered || self.notch_ui.grip_hovered) && grip_dist <= 26.3 && !self.notch_ui.orb_hovered;
+                // Mirrors the original's onHandle(): the orb is checked first;
+                // the grip is only live once the pair has been opened by the
+                // orb, so moving from the circle onto the dots keeps them out.
+                let near_orb = orb_dist <= notch_view::ORB_HOT_R;
+                let near_grip = grip_dist <= notch_view::GRIP_HOT_R;
+                let was_on_handle = self.notch_ui.orb_hovered || self.notch_ui.grip_hovered;
+                self.notch_ui.orb_hovered = near_orb;
+                self.notch_ui.grip_hovered = !near_orb && near_grip && was_on_handle;
                 let now = Instant::now();
                 let hov = self.notch_ui.orb_hovered || self.notch_ui.grip_hovered;
                 self.notch_ui.anim.set_orb(hov, now, self.motion_on);
@@ -607,9 +613,9 @@ impl NotchA {
                         self.notch_ui.hover_id = Some(cid.clone());
                         if let Some(idx) = self.cells.iter().position(|c| c.id == cid) {
                             let target_pos = if self.notch_ui.is_vertical() {
-                                layout.ring_centers[idx].y
+                                p.y
                             } else {
-                                layout.ring_centers[idx].x
+                                p.x
                             };
                             let target_h = notch_view::estimated_card_height(
                                 &self.cells[idx],
@@ -637,10 +643,10 @@ impl NotchA {
                 let orb_dist = ((p.x - layout.orb_center.x).powi(2) + (p.y - layout.orb_center.y).powi(2)).sqrt();
                 let grip_dist = ((p.x - layout.grip_center.x).powi(2) + (p.y - layout.grip_center.y).powi(2)).sqrt();
 
-                if grip_dist <= 26.3 && (self.notch_ui.grip_hovered || self.notch_ui.orb_hovered) {
+                if grip_dist <= notch_view::GRIP_HOT_R && (self.notch_ui.grip_hovered || self.notch_ui.orb_hovered) {
                     self.notch_ui.card_open = false;
                     carry::begin_carry(self.app.clone());
-                } else if orb_dist <= 28.5 {
+                } else if orb_dist <= notch_view::ORB_HOT_R {
                     self.app.send_ui(UiEvent::OpenSettings);
                 } else if alt_down() && layout.pill_rect.contains(p) {
                     self.notch_ui.card_open = false;
